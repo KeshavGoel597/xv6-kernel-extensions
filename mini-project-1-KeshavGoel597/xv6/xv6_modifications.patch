@@ -1,0 +1,3854 @@
+diff --git a/Makefile b/Makefile
+index 2d5f9e4..5b33744 100644
+--- a/Makefile
++++ b/Makefile
+@@ -47,11 +47,11 @@ TOOLPREFIX := $(shell if riscv64-unknown-elf-objdump -i 2>&1 | grep 'elf64-big'
+ 	else echo "***" 1>&2; \
+ 	echo "*** Error: Couldn't find a riscv64 version of GCC/binutils." 1>&2; \
+ 	echo "*** To turn off this error, run 'gmake TOOLPREFIX= ...'." 1>&2; \
+-	echo "***" 1>&2; exit 1; fi)
++	echo "***" 1>&2; exit 1; \
++	fi)
+ endif
+ 
+ QEMU = qemu-system-riscv64
+-MIN_QEMU_VERSION = 7.2
+ 
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+@@ -67,12 +67,22 @@ CFLAGS += -fno-common -nostdlib
+ CFLAGS += -fno-builtin-strncpy -fno-builtin-strncmp -fno-builtin-strlen -fno-builtin-memset
+ CFLAGS += -fno-builtin-memmove -fno-builtin-memcmp -fno-builtin-log -fno-builtin-bzero
+ CFLAGS += -fno-builtin-strchr -fno-builtin-exit -fno-builtin-malloc -fno-builtin-putc
+-CFLAGS += -fno-builtin-free
+-CFLAGS += -fno-builtin-memcpy -Wno-main
++CFLAGS += -fno-builtin-free -fno-builtin-memcpy -Wno-main
+ CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
+ CFLAGS += -I.
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ 
++# SCHEDULER MACRO DEFINITION
++ifeq ($(SCHEDULER), FCFS)
++CFLAGS += -DFCFS
++endif
++ifeq ($(SCHEDULER), CFS)
++CFLAGS += -DCFS
++endif
++ifeq ($(SCHEDULER), MLFQ)
++CFLAGS += -DMLFQ
++endif
++
+ # Disable PIE when possible (for Ubuntu 16.10 toolchain)
+ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+ CFLAGS += -fno-pie -no-pie
+@@ -88,18 +98,13 @@ $K/kernel: $(OBJS) $K/kernel.ld
+ 	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
+ 	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
+ 
+-$K/%.o: $K/%.S
+-	$(CC) -g -c -o $@ $<
+-
+-tags: $(OBJS)
+-	etags kernel/*.S kernel/*.c
+-
+ ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
+ 
+-_%: %.o $(ULIB) $U/user.ld
++# Rule for building user programs
++$U/_%: $U/%.o $(ULIB) $U/user.ld
+ 	$(LD) $(LDFLAGS) -T $U/user.ld -o $@ $< $(ULIB)
+-	$(OBJDUMP) -S $@ > $*.asm
+-	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
++	$(OBJDUMP) -S $@ > $U/$*.asm
++	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $U/$*.sym
+ 
+ $U/usys.S : $U/usys.pl
+ 	perl $U/usys.pl > $U/usys.S
+@@ -107,21 +112,6 @@ $U/usys.S : $U/usys.pl
+ $U/usys.o : $U/usys.S
+ 	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S
+ 
+-$U/_forktest: $U/forktest.o $(ULIB)
+-	# forktest has less library code linked in - needs to be small
+-	# in order to be able to max out the proc table.
+-	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_forktest $U/forktest.o $U/ulib.o $U/usys.o
+-	$(OBJDUMP) -S $U/_forktest > $U/forktest.asm
+-
+-mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+-	gcc -I. -o mkfs/mkfs mkfs/mkfs.c
+-
+-# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+-# that disk image changes after first build are persistent until clean.  More
+-# details:
+-# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
+-.PRECIOUS: %.o
+-
+ UPROGS=\
+ 	$U/_cat\
+ 	$U/_echo\
+@@ -142,6 +132,11 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_schedulertests\
++	$U/_readcount\
++
++mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
++	gcc -I. -o mkfs/mkfs mkfs/mkfs.c
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,15 +148,9 @@ clean:
+ 	*/*.o */*.d */*.asm */*.sym \
+ 	$K/kernel fs.img \
+ 	mkfs/mkfs .gdbinit \
+-        $U/usys.S \
++	$U/usys.S \
+ 	$(UPROGS)
+ 
+-# try to generate a unique GDB port
+-GDBPORT = $(shell expr `id -u` % 5000 + 25000)
+-# QEMU's gdb stub command line changed in 0.11
+-QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+-	then echo "-gdb tcp::$(GDBPORT)"; \
+-	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+ CPUS := 3
+ endif
+@@ -171,22 +160,5 @@ QEMUOPTS += -global virtio-mmio.force-legacy=false
+ QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
+ QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+ 
+-qemu: check-qemu-version $K/kernel fs.img
+-	$(QEMU) $(QEMUOPTS)
+-
+-.gdbinit: .gdbinit.tmpl-riscv
+-	sed "s/:1234/:$(GDBPORT)/" < $^ > $@
+-
+-qemu-gdb: $K/kernel .gdbinit fs.img
+-	@echo "*** Now run 'gdb' in another window." 1>&2
+-	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+-
+-print-gdbport:
+-	@echo $(GDBPORT)
+-
+-QEMU_VERSION := $(shell $(QEMU) --version | head -n 1 | sed -E 's/^QEMU emulator version ([0-9]+\.[0-9]+)\..*/\1/')
+-check-qemu-version:
+-	@if [ "$(shell echo "$(QEMU_VERSION) >= $(MIN_QEMU_VERSION)" | bc)" -eq 0 ]; then \
+-		echo "ERROR: Need qemu version >= $(MIN_QEMU_VERSION)"; \
+-		exit 1; \
+-	fi
++qemu: $K/kernel fs.img
++	$(QEMU) $(QEMUOPTS)
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..7b4b2bc 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -101,6 +101,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            update_runtime(void); // <-- ADD THIS LINE
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -129,6 +130,7 @@ int             strncmp(const char*, const char*, uint);
+ char*           strncpy(char*, const char*, int);
+ 
+ // syscall.c
++void            syscall_init(void);
+ void            argint(int, int*);
+ int             argstr(int, char*, int);
+ void            argaddr(int, uint64 *);
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..1db8faa 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -20,6 +20,7 @@ main()
+     kvminit();       // create kernel page table
+     kvminithart();   // turn on paging
+     procinit();      // process table
++    syscall_init();  // Add this line
+     trapinit();      // trap vectors
+     trapinithart();  // install kernel trap vector
+     plicinit();      // set up interrupt controller
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 9d6cf3f..7cd5dac 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -7,9 +7,7 @@
+ #include "defs.h"
+ 
+ struct cpu cpus[NCPU];
+-
+ struct proc proc[NPROC];
+-
+ struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -18,37 +16,41 @@ struct spinlock pid_lock;
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+ 
+-extern char trampoline[]; // trampoline.S
+-
+-// helps ensure that wakeups of wait()ing
+-// parents are not lost. helps obey the
+-// memory model when using p->parent.
+-// must be acquired before any p->lock.
++extern char trampoline[];
+ struct spinlock wait_lock;
+ 
+-// Allocate a page for each process's kernel stack.
+-// Map it high in memory, followed by an invalid
+-// guard page.
+-void
+-proc_mapstacks(pagetable_t kpgtbl)
+-{
++#ifdef MLFQ
++#define BOOST_INTERVAL 48 // The interval for priority boost
++const int time_slices[4] = {1, 4, 8, 16}; // Time slices for queues 0, 1, 2, 3
++uint boost_timer = 0; // Global timer for priority boost
++#endif
++
++// #ifdef CFS
++// #define NICE_DEFAULT 0
++// #define TARGET_LATENCY 48
++// #define MIN_SLICE 3
++// #define WEIGHT_SCALE 100
++
++const int nice_to_weight[40] = {
++    88761, 71755, 56364, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 
++    9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
++    1024,  820,   655,   526,   423,   335,   272,   215,   172,   137,
++    110,   87,    70,    56,    45,    36,    29,    23,    18,    15
++};
++// #endif
++
++void proc_mapstacks(pagetable_t kpgtbl) {
+   struct proc *p;
+-  
+   for(p = proc; p < &proc[NPROC]; p++) {
+     char *pa = kalloc();
+-    if(pa == 0)
+-      panic("kalloc");
++    if(pa == 0) panic("kalloc");
+     uint64 va = KSTACK((int) (p - proc));
+     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+   }
+ }
+ 
+-// initialize the proc table.
+-void
+-procinit(void)
+-{
++void procinit(void) {
+   struct proc *p;
+-  
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
+   for(p = proc; p < &proc[NPROC]; p++) {
+@@ -58,30 +60,15 @@ procinit(void)
+   }
+ }
+ 
+-// Must be called with interrupts disabled,
+-// to prevent race with process being moved
+-// to a different CPU.
+-int
+-cpuid()
+-{
+-  int id = r_tp();
+-  return id;
+-}
++int cpuid() { return r_tp(); }
+ 
+-// Return this CPU's cpu struct.
+-// Interrupts must be disabled.
+-struct cpu*
+-mycpu(void)
+-{
++struct cpu* mycpu(void) {
+   int id = cpuid();
+   struct cpu *c = &cpus[id];
+   return c;
+ }
+ 
+-// Return the current struct proc *, or zero if none.
+-struct proc*
+-myproc(void)
+-{
++struct proc* myproc(void) {
+   push_off();
+   struct cpu *c = mycpu();
+   struct proc *p = c->proc;
+@@ -89,35 +76,21 @@ myproc(void)
+   return p;
+ }
+ 
+-int
+-allocpid()
+-{
++int allocpid() {
+   int pid;
+-  
+   acquire(&pid_lock);
+   pid = nextpid;
+   nextpid = nextpid + 1;
+   release(&pid_lock);
+-
+   return pid;
+ }
+ 
+-// Look in the process table for an UNUSED proc.
+-// If found, initialize state required to run in the kernel,
+-// and return with p->lock held.
+-// If there are no free procs, or a memory allocation fails, return 0.
+-static struct proc*
+-allocproc(void)
+-{
++static struct proc* allocproc(void) {
+   struct proc *p;
+-
+   for(p = proc; p < &proc[NPROC]; p++) {
+     acquire(&p->lock);
+-    if(p->state == UNUSED) {
+-      goto found;
+-    } else {
+-      release(&p->lock);
+-    }
++    if(p->state == UNUSED) goto found;
++    else release(&p->lock);
+   }
+   return 0;
+ 
+@@ -125,41 +98,46 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
+-  // Allocate a trapframe page.
++#if defined(CFS) || defined(FCFS) || defined(MLFQ)
++  p->creation_time = ticks;
++#endif
++
++#ifdef CFS
++  p->nice = NICE_DEFAULT;
++  p->vruntime = 0;
++  p->time_slice = 0;
++  p->ticks_in_slice = 0;
++  p->run_ticks = 0;
++  p->sleep_ticks = 0;
++  p->sleep_start_time = 0;
++#endif
++
++#ifdef MLFQ
++  p->priority_queue = 0; // New processes start at the highest priority
++  p->ticks_in_slice = 0;
++#endif
++
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+   }
+-
+-  // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+   }
+-
+-  // Set up new context to start executing at forkret,
+-  // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+-
+   return p;
+ }
+ 
+-// free a proc structure and the data hanging from it,
+-// including user pages.
+-// p->lock must be held.
+-static void
+-freeproc(struct proc *p)
+-{
+-  if(p->trapframe)
+-    kfree((void*)p->trapframe);
++static void freeproc(struct proc *p) {
++  if(p->trapframe) kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  if(p->pagetable) proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -171,79 +149,43 @@ freeproc(struct proc *p)
+   p->state = UNUSED;
+ }
+ 
+-// Create a user page table for a given process, with no user memory,
+-// but with trampoline and trapframe pages.
+-pagetable_t
+-proc_pagetable(struct proc *p)
+-{
++pagetable_t proc_pagetable(struct proc *p) {
+   pagetable_t pagetable;
+-
+-  // An empty page table.
+   pagetable = uvmcreate();
+-  if(pagetable == 0)
+-    return 0;
+-
+-  // map the trampoline code (for system call return)
+-  // at the highest user virtual address.
+-  // only the supervisor uses it, on the way
+-  // to/from user space, so not PTE_U.
+-  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+-              (uint64)trampoline, PTE_R | PTE_X) < 0){
++  if(pagetable == 0) return 0;
++  if(mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) < 0){
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+-
+-  // map the trapframe page just below the trampoline page, for
+-  // trampoline.S.
+-  if(mappages(pagetable, TRAPFRAME, PGSIZE,
+-              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
++  if(mappages(pagetable, TRAPFRAME, PGSIZE, (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+-
+   return pagetable;
+ }
+ 
+-// Free a process's page table, and free the
+-// physical memory it refers to.
+-void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
+-{
++void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+-// Set up first user process.
+-void
+-userinit(void)
+-{
++void userinit(void) {
+   struct proc *p;
+-
+   p = allocproc();
+   initproc = p;
+-  
+   p->cwd = namei("/");
+-
+   p->state = RUNNABLE;
+-
+   release(&p->lock);
+ }
+ 
+-// Shrink user memory by n bytes.
+-// Return 0 on success, -1 on failure.
+-int
+-growproc(int n)
+-{
+-  uint64 sz;
++int growproc(int n) {
++  uint sz;
+   struct proc *p = myproc();
+-
+   sz = p->sz;
+   if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+-      return -1;
+-    }
++    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) return -1;
+   } else if(n < 0){
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+@@ -251,64 +193,34 @@ growproc(int n)
+   return 0;
+ }
+ 
+-// Create a new process, copying the parent.
+-// Sets up child kernel stack to return as if from fork() system call.
+-int
+-kfork(void)
+-{
++int kfork(void) {
+   int i, pid;
+-  struct proc *np;
+-  struct proc *p = myproc();
+-
+-  // Allocate process.
+-  if((np = allocproc()) == 0){
+-    return -1;
+-  }
+-
+-  // Copy user memory from parent to child.
++  struct proc *np, *p = myproc();
++  if((np = allocproc()) == 0) return -1;
+   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+     freeproc(np);
+     release(&np->lock);
+     return -1;
+   }
+   np->sz = p->sz;
+-
+-  // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+-
+-  // Cause fork to return 0 in the child.
+   np->trapframe->a0 = 0;
+-
+-  // increment reference counts on open file descriptors.
+-  for(i = 0; i < NOFILE; i++)
+-    if(p->ofile[i])
+-      np->ofile[i] = filedup(p->ofile[i]);
++  for(i = 0; i < NOFILE; i++) if(p->ofile[i]) np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+-
+   safestrcpy(np->name, p->name, sizeof(p->name));
+-
+   pid = np->pid;
+-
+   release(&np->lock);
+-
+   acquire(&wait_lock);
+   np->parent = p;
+   release(&wait_lock);
+-
+   acquire(&np->lock);
+   np->state = RUNNABLE;
+   release(&np->lock);
+-
+   return pid;
+ }
+ 
+-// Pass p's abandoned children to init.
+-// Caller must hold wait_lock.
+-void
+-reparent(struct proc *p)
+-{
++void reparent(struct proc *p) {
+   struct proc *pp;
+-
+   for(pp = proc; pp < &proc[NPROC]; pp++){
+     if(pp->parent == p){
+       pp->parent = initproc;
+@@ -317,18 +229,9 @@ reparent(struct proc *p)
+   }
+ }
+ 
+-// Exit the current process.  Does not return.
+-// An exited process remains in the zombie state
+-// until its parent calls wait().
+-void
+-kexit(int status)
+-{
++void kexit(int status) {
+   struct proc *p = myproc();
+-
+-  if(p == initproc)
+-    panic("init exiting");
+-
+-  // Close all open files.
++  if(p == initproc) panic("init exiting");
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
+       struct file *f = p->ofile[fd];
+@@ -336,57 +239,35 @@ kexit(int status)
+       p->ofile[fd] = 0;
+     }
+   }
+-
+   begin_op();
+   iput(p->cwd);
+   end_op();
+   p->cwd = 0;
+-
+   acquire(&wait_lock);
+-
+-  // Give any children to init.
+   reparent(p);
+-
+-  // Parent might be sleeping in wait().
+   wakeup(p->parent);
+-  
+   acquire(&p->lock);
+-
+   p->xstate = status;
+   p->state = ZOMBIE;
+-
+   release(&wait_lock);
+-
+-  // Jump into the scheduler, never to return.
+   sched();
+   panic("zombie exit");
+ }
+ 
+-// Wait for a child process to exit and return its pid.
+-// Return -1 if this process has no children.
+-int
+-kwait(uint64 addr)
+-{
++int kwait(uint64 addr) {
+   struct proc *pp;
+   int havekids, pid;
+   struct proc *p = myproc();
+-
+   acquire(&wait_lock);
+-
+   for(;;){
+-    // Scan through table looking for exited children.
+     havekids = 0;
+     for(pp = proc; pp < &proc[NPROC]; pp++){
+       if(pp->parent == p){
+-        // make sure the child isn't still in exit() or swtch().
+         acquire(&pp->lock);
+-
+         havekids = 1;
+         if(pp->state == ZOMBIE){
+-          // Found one.
+           pid = pp->pid;
+-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+-                                  sizeof(pp->xstate)) < 0) {
++          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate, sizeof(pp->xstate)) < 0) {
+             release(&pp->lock);
+             release(&wait_lock);
+             return -1;
+@@ -399,97 +280,766 @@ kwait(uint64 addr)
+         release(&pp->lock);
+       }
+     }
+-
+-    // No point waiting if we don't have any children.
+     if(!havekids || killed(p)){
+       release(&wait_lock);
+       return -1;
+     }
+-    
+-    // Wait for a child to exit.
+-    sleep(p, &wait_lock);  //DOC: wait-sleep
++    sleep(p, &wait_lock);
+   }
+ }
+ 
+-// Per-CPU process scheduler.
+-// Each CPU calls scheduler() after setting itself up.
+-// Scheduler never returns.  It loops, doing:
+-//  - choose a process to run.
+-//  - swtch to start running that process.
+-//  - eventually that process transfers control
+-//    via swtch back to the scheduler.
++
++
++// void
++// scheduler(void)
++// {
++//   // struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++
++// #if defined(CFS)
++// struct proc *p;
++//     // --- COMPLETELY FAIR SCHEDULER ---
++//     // ... (existing CFS code) ...
++
++// #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER ---
++//     // ... (existing FCFS code) ...
++
++// #else
++//     // --- DEFAULT ROUND ROBIN SCHEDULER ---
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
++
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++
++// #if defined(CFS)
++//     // --- COMPLETELY FAIR SCHEDULER ---
++//     // ... (existing CFS code) ...
++
++// #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER ---
++//     // ... (existing FCFS code) ...
++
++// #elif defined(MLFQ)
++//     // --- MULTI-LEVEL FEEDBACK QUEUE SCHEDULER ---
++//     struct proc *best_p = 0;
++
++//     // Priority Boost: If the timer exceeds the interval, move all processes to queue 0.
++//     acquire(&tickslock);
++//     if(boost_timer >= BOOST_INTERVAL) {
++//       boost_timer = 0;
++//       release(&tickslock);
++//       // Elevate priority of all processes
++//       for(p = proc; p < &proc[NPROC]; p++){
++//         acquire(&p->lock);
++//         if(p->state == RUNNABLE || p->state == SLEEPING) {
++//           p->priority_queue = 0;
++//           p->ticks_in_slice = 0;
++//         }
++//         release(&p->lock);
++//       }
++//     } else {
++//       release(&tickslock);
++//     }
++    
++//     // Find a process to run by iterating from highest to lowest priority queue.
++//     for(int queue = 0; queue < 4; queue++) {
++//       for(p = proc; p < &proc[NPROC]; p++) {
++//         if(p->state == RUNNABLE && p->priority_queue == queue) {
++//           best_p = p;
++//           goto found_process;
++//         }
++//       }
++//     }
++
++// found_process:
++//     if(best_p) {
++//       p = best_p;
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     } else {
++//       asm volatile("wfi"); // Wait for interrupt if no runnable processes
++//     }
++// #else
++//     // --- DEFAULT ROUND ROBIN SCHEDULER ---
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
+ void
+ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+-
+   c->proc = 0;
+   for(;;){
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+-    intr_off();
+ 
+-    int found = 0;
++#ifdef CFS
++    // --- COMPLETELY FAIR SCHEDULER (CFS) ---
++    struct proc *min_vruntime_proc = 0;
++    int runnable_procs = 0;
++    for (p = proc; p < &proc[NPROC]; p++) {
++        if (p->state == RUNNABLE) runnable_procs++;
++    }
++
++    if (runnable_procs > 0) {
++        printf("\n[Scheduler Tick CFS]\n");
++        for (p = proc; p < &proc[NPROC]; p++) {
++            if (p->state == RUNNABLE) {
++                printf("PID: %d | vRuntime: %lu\n", p->pid, p->vruntime);
++            }
++        }
++        for (p = proc; p < &proc[NPROC]; p++) {
++            if (p->state == RUNNABLE) {
++                if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++                    min_vruntime_proc = p;
++                }
++            }
++        }
++        if (min_vruntime_proc) {
++            printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++            p = min_vruntime_proc;
++            acquire(&p->lock);
++            if (p->state == RUNNABLE) {
++                uint slice = TARGET_LATENCY / runnable_procs;
++                p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++                p->ticks_in_slice = 0;
++                p->state = RUNNING;
++                c->proc = p;
++                swtch(&c->context, &p->context);
++                c->proc = 0;
++            }
++            release(&p->lock);
++        }
++    } else {
++        asm volatile("wfi");
++    }
++
++#elif defined(FCFS)
++    // --- FIRST-COME, FIRST-SERVED (FCFS) - DEADLOCK-FREE VERSION ---
++    struct proc *earliest_proc = 0;
++
++    // Find the earliest runnable process without holding locks (racy read is safe for candidate selection).
++    for(p = proc; p < &proc[NPROC]; p++) {
++        if(p->state == RUNNABLE) {
++            if(earliest_proc == 0 || p->creation_time < earliest_proc->creation_time) {
++                earliest_proc = p;
++            }
++        }
++    }
++
++    if (earliest_proc) {
++        // --- IMPROVED LOGGING ---
++        printf("\n[Scheduler Tick FCFS]\n");
++        printf("Runnable Processes:\n");
++        for(p = proc; p < &proc[NPROC]; p++) {
++            if(p->state == RUNNABLE) {
++                printf("  - PID: %d (Created at: %d)\n", p->pid, p->creation_time);
++            }
++        }
++        printf("Sleeping Processes:\n");
++        for(p = proc; p < &proc[NPROC]; p++) {
++            if(p->state == SLEEPING) {
++                printf("  - PID: %d\n", p->pid);
++            }
++        }
++        printf("--> Decision: Scheduling PID %d\n", earliest_proc->pid);
++        // --- END LOGGING ---
++
++        p = earliest_proc;
++        acquire(&p->lock);
++        if(p->state == RUNNABLE) { // Re-check state after acquiring lock
++            p->state = RUNNING;
++            c->proc = p;
++            swtch(&c->context, &p->context);
++            c->proc = 0;
++        }
++        release(&p->lock);
++
++    } else {
++        // If no runnable processes, wait for an interrupt.
++        asm volatile("wfi");
++    }
++
++
++#elif defined(MLFQ)
++    // --- MULTI-LEVEL FEEDBACK QUEUE SCHEDULER ---
++    struct proc *best_p = 0;
++    int runnable_found = 0;
++
++    // Priority Boost: If the timer exceeds the interval, move all processes to queue 0.
++    acquire(&tickslock);
++    if(boost_timer >= BOOST_INTERVAL) {
++      boost_timer = 0;
++      release(&tickslock);
++      
++      printf("\n** PRIORITY BOOST **\n"); // Log the priority boost event
++      
++      for(p = proc; p < &proc[NPROC]; p++){
++        acquire(&p->lock);
++        if(p->state == RUNNABLE || p->state == SLEEPING) {
++          p->priority_queue = 0;
++          p->ticks_in_slice = 0;
++        }
++        release(&p->lock);
++      }
++    } else {
++      release(&tickslock);
++    }
++    
++    // Check if there are any runnable processes before logging.
++    for(p = proc; p < &proc[NPROC]; p++) {
++        if(p->state == RUNNABLE) {
++            runnable_found = 1;
++            break;
++        }
++    }
++
++    if(runnable_found) {
++        // --- MLFQ LOGGING ---
++        printf("\n[Scheduler Tick MLFQ]\n");
++        for(int queue = 0; queue < 4; queue++) {
++            printf("  Queue %d: ", queue);
++            int is_empty = 1;
++            for(p = proc; p < &proc[NPROC]; p++) {
++                if(p->state == RUNNABLE && p->priority_queue == queue) {
++                    printf("PID %d ", p->pid);
++                    is_empty = 0;
++                }
++            }
++            if(is_empty) {
++                printf("(empty)");
++            }
++            printf("\n");
++        }
++        // --- END LOGGING ---
++
++        // Find a process to run by iterating from highest to lowest priority queue.
++        for(int queue = 0; queue < 4; queue++) {
++          for(p = proc; p < &proc[NPROC]; p++) {
++            if(p->state == RUNNABLE && p->priority_queue == queue) {
++              best_p = p;
++              goto found_mlfq_proc; // Break out of both loops
++            }
++          }
++        }
++
++    found_mlfq_proc:
++        if(best_p) {
++          printf("--> Decision: Scheduling PID %d from Queue %d\n", best_p->pid, best_p->priority_queue);
++          p = best_p;
++          acquire(&p->lock);
++          if(p->state == RUNNABLE) {
++            p->state = RUNNING;
++            c->proc = p;
++            swtch(&c->context, &p->context);
++            c->proc = 0;
++          }
++          release(&p->lock);
++        }
++    } else {
++      asm volatile("wfi"); // Wait for interrupt if no runnable processes
++    }
++
++#else
++    // --- DEFAULT ROUND ROBIN SCHEDULER ---
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+         c->proc = 0;
+-        found = 1;
+       }
+       release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
+-    }
++#endif
+   }
+ }
+ 
+-// Switch to scheduler.  Must hold only p->lock
+-// and have changed proc->state. Saves and restores
+-// intena because intena is a property of this
+-// kernel thread, not this CPU. It should
+-// be proc->intena and proc->noff, but that would
+-// break in the few places where a lock is held but
+-// there's no process.
+-void
+-sched(void)
+-{
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++
++// #ifdef CFS
++//     // --- COMPLETELY FAIR SCHEDULER (CFS) ---
++//     struct proc *min_vruntime_proc = 0;
++//     int runnable_procs = 0;
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         if (p->state == RUNNABLE) runnable_procs++;
++//     }
++
++//     if (runnable_procs > 0) {
++//         printf("\n[Scheduler Tick CFS]\n");
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 printf("PID: %d | vRuntime: %lu\n", p->pid, p->vruntime);
++//             }
++//         }
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++//                     min_vruntime_proc = p;
++//                 }
++//             }
++//         }
++//         if (min_vruntime_proc) {
++//             printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++//             p = min_vruntime_proc;
++//             acquire(&p->lock);
++//             if (p->state == RUNNABLE) {
++//                 uint slice = TARGET_LATENCY / runnable_procs;
++//                 p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++//                 p->ticks_in_slice = 0;
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER (FCFS) ---
++//     struct proc *earliest_proc = 0;
++
++//     // Find the earliest runnable process (candidate selection).
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//         if(p->state == RUNNABLE) {
++//             if(earliest_proc == 0 || p->creation_time < earliest_proc->creation_time) {
++//                 earliest_proc = p;
++//             }
++//         }
++//     }
++
++//     if (earliest_proc) {
++//         // --- IMPROVED LOGGING ---
++//         printf("\n[Scheduler Tick FCFS]\n");
++//         printf("Runnable Processes:\n");
++//         for(p = proc; p < &proc[NPROC]; p++) {
++//             if(p->state == RUNNABLE) {
++//                 printf("  - PID: %d (Created at: %d)\n", p->pid, p->creation_time);
++//             }
++//         }
++//         printf("Sleeping Processes:\n");
++//         for(p = proc; p < &proc[NPROC]; p++) {
++//             if(p->state == SLEEPING) {
++//                 printf("  - PID: %d\n", p->pid);
++//             }
++//         }
++//         printf("--> Decision: Scheduling PID %d\n", earliest_proc->pid);
++//         // --- END LOGGING ---
++
++//         p = earliest_proc;
++//         acquire(&p->lock);
++//         if(p->state == RUNNABLE) { // Re-check state after acquiring lock
++//             p->state = RUNNING;
++//             c->proc = p;
++//             swtch(&c->context, &p->context);
++//             c->proc = 0;
++//         }
++//         release(&p->lock);
++
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #else
++//     // --- DEFAULT ROUND ROBIN SCHEDULER ---
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
++//<------------------------VERSION-3-------------------->
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++
++// #ifdef CFS
++//     // --- COMPLETELY FAIR SCHEDULER (CFS) ---
++//     struct proc *min_vruntime_proc = 0;
++//     int runnable_procs = 0;
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         if (p->state == RUNNABLE) runnable_procs++;
++//     }
++
++//     if (runnable_procs > 0) {
++//         printf("\n[Scheduler Tick CFS]\n");
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 printf("PID: %d | vRuntime: %lu\n", p->pid, p->vruntime);
++//             }
++//         }
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++//                     min_vruntime_proc = p;
++//                 }
++//             }
++//         }
++//         if (min_vruntime_proc) {
++//             printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++//             p = min_vruntime_proc;
++//             acquire(&p->lock);
++//             if (p->state == RUNNABLE) {
++//                 uint slice = TARGET_LATENCY / runnable_procs;
++//                 p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++//                 p->ticks_in_slice = 0;
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER (FCFS) - SAFE LOCKING ---
++//     struct proc *earliest_p = 0;
++
++//     // Find the best candidate process. This loop acquires and releases locks
++//     // carefully, holding the lock only on the best-so-far candidate.
++//     for(p = proc; p < &proc[NPROC]; p++){
++//         acquire(&p->lock);
++//         if(p->state == RUNNABLE){
++//             if(earliest_p == 0){
++//                 // First runnable process found.
++//                 earliest_p = p;
++//             } else {
++//                 if(p->creation_time < earliest_p->creation_time){
++//                     // This process is better. Release the old best and keep this one.
++//                     release(&earliest_p->lock);
++//                     earliest_p = p;
++//                 } else {
++//                     // This process is not better, release its lock.
++//                     release(&p->lock);
++//                 }
++//             }
++//         } else {
++//             release(&p->lock);
++//         }
++//     }
++
++//     // If we found a runnable process, run it.
++//     if(earliest_p){
++//         p = earliest_p;
++        
++//         // Logging
++//         printf("\n[Scheduler Tick FCFS]\n");
++//         printf("--> Scheduling PID %d (Creation Time: %d)\n", p->pid, p->creation_time);
++
++//         // Run the process. We are already holding its lock.
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++        
++//         // Release the lock after the process yields or exits.
++//         release(&p->lock);
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #else
++//     // --- DEFAULT ROUND ROBIN SCHEDULER ---
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
++//<------------------------VERSION-2-------------------->
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++
++// #ifdef CFS
++//     // --- COMPLETELY FAIR SCHEDULER (CFS) ---
++//     struct proc *min_vruntime_proc = 0;
++//     int runnable_procs = 0;
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         if (p->state == RUNNABLE) runnable_procs++;
++//     }
++
++//     if (runnable_procs > 0) {
++//         printf("\n[Scheduler Tick CFS]\n");
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 printf("PID: %d | vRuntime: %lu\n", p->pid, p->vruntime);
++//             }
++//         }
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++//                     min_vruntime_proc = p;
++//                 }
++//             }
++//         }
++//         if (min_vruntime_proc) {
++//             printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++//             p = min_vruntime_proc;
++//             acquire(&p->lock);
++//             if (p->state == RUNNABLE) {
++//                 uint slice = TARGET_LATENCY / runnable_procs;
++//                 p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++//                 p->ticks_in_slice = 0;
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER (FCFS) ---
++//     struct proc *earliest_proc = 0;
++//     int runnable_procs = 0;
++
++//     // First, check if there's anything to do.
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//         if(p->state == RUNNABLE) {
++//             runnable_procs++;
++//         }
++//     }
++
++//     if (runnable_procs > 0) {
++//         // Find the runnable process with the earliest creation time.
++//         for(p = proc; p < &proc[NPROC]; p++) {
++//             if(p->state == RUNNABLE) {
++//                 if(earliest_proc == 0 || p->creation_time < earliest_proc->creation_time) {
++//                     earliest_proc = p;
++//                 }
++//             }
++//         }
++
++//         if(earliest_proc) {
++//             // Log the state before scheduling.
++//             printf("\n[Scheduler Tick FCFS]\n");
++//             for(p = proc; p < &proc[NPROC]; p++) {
++//                 if(p->state == RUNNABLE) {
++//                     printf("PID: %d | Creation Time: %d\n", p->pid, p->creation_time);
++//                 }
++//             }
++//             printf("--> Scheduling PID %d (earliest creation time)\n", earliest_proc->pid);
++
++//             p = earliest_proc;
++//             acquire(&p->lock);
++//             if(p->state == RUNNABLE) {
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++// #else
++//     // --- DEFAULT ROUND ROBIN SCHEDULER ---
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
++// <-----------------------VERSION-1--------------------->
++// void scheduler(void) {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++//   c->proc = 0;
++//   for(;;){
++//     intr_on();
++// #ifdef CFS
++//     struct proc *min_vruntime_proc = 0;
++//     int runnable_procs = 0;
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         if (p->state == RUNNABLE) runnable_procs++;
++//     }
++//     if (runnable_procs > 0) {
++//         printf("\n[Scheduler Tick]\n");
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 printf("PID: %d | vRuntime: %lu\n", p->pid, p->vruntime);
++//             }
++//         }
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++//                     min_vruntime_proc = p;
++//                 }
++//             }
++//         }
++//         if (min_vruntime_proc) {
++//             printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++//             p = min_vruntime_proc;
++//             acquire(&p->lock);
++//             if (p->state == RUNNABLE) {
++//                 uint slice = TARGET_LATENCY / runnable_procs;
++//                 p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++//                 p->ticks_in_slice = 0;
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         asm volatile("wfi");
++//     }
++
++//     #elif defined(FCFS)
++//     // --- FIRST-COME, FIRST-SERVED SCHEDULER (FCFS) ---
++//     struct proc *earliest_proc = 0;
++
++//     // Find the runnable process with the earliest creation time.
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//         if(p->state == RUNNABLE) {
++//             if(earliest_proc == 0 || p->creation_time < earliest_proc->creation_time) {
++//                 earliest_proc = p;
++//             }
++//         }
++//     }
++
++//     if(earliest_proc) {
++//         p = earliest_proc;
++//         acquire(&p->lock);
++//         // Re-check state after acquiring lock.
++//         if(p->state == RUNNABLE) {
++//             // Switch to the chosen process.
++//             p->state = RUNNING;
++//             c->proc = p;
++//             swtch(&c->context, &p->context);
++//             // Process has yielded or exited.
++//             c->proc = 0;
++//         }
++//         release(&p->lock);
++//     } else {
++//         // No runnable processes; wait for an interrupt.
++//         asm volatile("wfi");
++//     }
++
++// #else
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++// #endif
++//   }
++// }
++
++
++void sched(void) {
+   int intena;
+   struct proc *p = myproc();
+-
+-  if(!holding(&p->lock))
+-    panic("sched p->lock");
+-  if(mycpu()->noff != 1)
+-    panic("sched locks");
+-  if(p->state == RUNNING)
+-    panic("sched RUNNING");
+-  if(intr_get())
+-    panic("sched interruptible");
+-
++  if(!holding(&p->lock)) panic("sched p->lock");
++  if(mycpu()->noff != 1) panic("sched locks");
++  if(p->state == RUNNING) panic("sched running");
++  if(intr_get()) panic("sched interruptible");
+   intena = mycpu()->intena;
+   swtch(&p->context, &mycpu()->context);
+   mycpu()->intena = intena;
+ }
+ 
+-// Give up the CPU for one scheduling round.
+-void
+-yield(void)
+-{
++void yield(void) {
+   struct proc *p = myproc();
+   acquire(&p->lock);
+   p->state = RUNNABLE;
+@@ -497,85 +1047,48 @@ yield(void)
+   release(&p->lock);
+ }
+ 
+-// A fork child's very first scheduling by scheduler()
+-// will swtch to forkret.
+-void
+-forkret(void)
+-{
++void forkret(void) {
+   extern char userret[];
+   static int first = 1;
+   struct proc *p = myproc();
+-
+-  // Still holding p->lock from scheduler.
+   release(&p->lock);
+-
+   if (first) {
+-    // File system initialization must be run in the context of a
+-    // regular process (e.g., because it calls sleep), and thus cannot
+-    // be run from main().
+     fsinit(ROOTDEV);
+-
+     first = 0;
+-    // ensure other cores see first=0.
+     __sync_synchronize();
+-
+-    // We can invoke kexec() now that file system is initialized.
+-    // Put the return value (argc) of kexec into a0.
+     p->trapframe->a0 = kexec("/init", (char *[]){ "/init", 0 });
+-    if (p->trapframe->a0 == -1) {
+-      panic("exec");
+-    }
++    if (p->trapframe->a0 == -1) panic("exec");
+   }
+-
+-  // return to user space, mimicing usertrap()'s return.
+   prepare_return();
+   uint64 satp = MAKE_SATP(p->pagetable);
+   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+   ((void (*)(uint64))trampoline_userret)(satp);
+ }
+ 
+-// Sleep on channel chan, releasing condition lock lk.
+-// Re-acquires lk when awakened.
+-void
+-sleep(void *chan, struct spinlock *lk)
+-{
++void sleep(void *chan, struct spinlock *lk) {
+   struct proc *p = myproc();
+-  
+-  // Must acquire p->lock in order to
+-  // change p->state and then call sched.
+-  // Once we hold p->lock, we can be
+-  // guaranteed that we won't miss any wakeup
+-  // (wakeup locks p->lock),
+-  // so it's okay to release lk.
+-
+-  acquire(&p->lock);  //DOC: sleeplock1
++  acquire(&p->lock);
+   release(lk);
+-
+-  // Go to sleep.
+   p->chan = chan;
++#ifdef CFS
++  p->sleep_start_time = ticks;
++#endif
+   p->state = SLEEPING;
+-
+   sched();
+-
+-  // Tidy up.
+   p->chan = 0;
+-
+-  // Reacquire original lock.
+   release(&p->lock);
+   acquire(lk);
+ }
+ 
+-// Wake up all processes sleeping on channel chan.
+-// Caller should hold the condition lock.
+-void
+-wakeup(void *chan)
+-{
++void wakeup(void *chan) {
+   struct proc *p;
+-
+   for(p = proc; p < &proc[NPROC]; p++) {
+     if(p != myproc()){
+       acquire(&p->lock);
+       if(p->state == SLEEPING && p->chan == chan) {
++#ifdef CFS
++  p->sleep_ticks += ticks - p->sleep_start_time;
++#endif
+         p->state = RUNNABLE;
+       }
+       release(&p->lock);
+@@ -583,22 +1096,13 @@ wakeup(void *chan)
+   }
+ }
+ 
+-// Kill the process with the given pid.
+-// The victim won't exit until it tries to return
+-// to user space (see usertrap() in trap.c).
+-int
+-kkill(int pid)
+-{
++int kkill(int pid) {
+   struct proc *p;
+-
+   for(p = proc; p < &proc[NPROC]; p++){
+     acquire(&p->lock);
+     if(p->pid == pid){
+       p->killed = 1;
+-      if(p->state == SLEEPING){
+-        // Wake process from sleep().
+-        p->state = RUNNABLE;
+-      }
++      if(p->state == SLEEPING) p->state = RUNNABLE;
+       release(&p->lock);
+       return 0;
+     }
+@@ -607,25 +1111,31 @@ kkill(int pid)
+   return -1;
+ }
+ 
+-void
+-setkilled(struct proc *p)
+-{
+-  acquire(&p->lock);
+-  p->killed = 1;
+-  release(&p->lock);
+-}
++void setkilled(struct proc *p) { acquire(&p->lock); p->killed = 1; release(&p->lock); }
++int killed(struct proc *p) { int k; acquire(&p->lock); k = p->killed; release(&p->lock); return k; }
+ 
+-int
+-killed(struct proc *p)
+-{
+-  int k;
+-  
+-  acquire(&p->lock);
+-  k = p->killed;
+-  release(&p->lock);
+-  return k;
++void procdump(void) {
++  static char *states[] = {[UNUSED] "unused", [USED] "used", [SLEEPING] "sleep ", [RUNNABLE] "runble", [RUNNING] "run   ", [ZOMBIE] "zombie"};
++  struct proc *p;
++  char *state;
++  printf("\n");
++  for(p = proc; p < &proc[NPROC]; p++){
++    if(p->state == UNUSED) continue;
++    if(p->state >= 0 && p->state < NELEM(states) && states[p->state]) state = states[p->state];
++    else state = "???";
++#ifdef CFS
++    printf("%d %s %s nice:%d vruntime:%lu", p->pid, state, p->name, p->nice, p->vruntime);
++#else
++    printf("%d %s %s", p->pid, state, p->name);
++#endif
++    printf("\n");
++  }
+ }
+ 
++
++
++// Add these two functions to the end of kernel/proc.c
++
+ // Copy to either a user address, or kernel address,
+ // depending on usr_dst.
+ // Returns 0 on success, -1 on error.
+@@ -656,32 +1166,863 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+   }
+ }
+ 
+-// Print a process listing to console.  For debugging.
+-// Runs when user types ^P on console.
+-// No lock to avoid wedging a stuck machine further.
+-void
+-procdump(void)
+-{
+-  static char *states[] = {
+-  [UNUSED]    "unused",
+-  [USED]      "used",
+-  [SLEEPING]  "sleep ",
+-  [RUNNABLE]  "runble",
+-  [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
+-  };
+-  struct proc *p;
+-  char *state;
++// #include "types.h"
++// #include "param.h"
++// #include "memlayout.h"
++// #include "riscv.h"
++// #include "spinlock.h"
++// #include "proc.h"
++// #include "defs.h"
++
++// struct cpu cpus[NCPU];
++
++// struct proc proc[NPROC];
++
++// struct proc *initproc;
++
++// int nextpid = 1;
++// struct spinlock pid_lock;
++
++// extern void forkret(void);
++// static void freeproc(struct proc *p);
++
++// extern char trampoline[]; // trampoline.S
++
++// // helps ensure that wakeups of wait()ing
++// // parents are not lost. helps obey the
++// // memory model when using p->parent.
++// // must be acquired before any p->lock.
++// struct spinlock wait_lock;
++
++// #ifdef CFS
++// #define NICE_DEFAULT 0
++// #define TARGET_LATENCY 48 // ticks
++// #define MIN_SLICE 3       // ticks
++// #define WEIGHT_SCALE 100  // Scale factor for vruntime updates
++
++// // Pre-calculated weights based on the formula: weight = 1024 / (1.25 ^ nice)
++// // Index corresponds to nice value + 20.
++// static const int nice_to_weight[40] = {
++//     88761, 71755, 56364, 46273, 36291, // nice -20 to -16
++//     29154, 23254, 18705, 14949, 11916, // nice -15 to -11
++//     9548,  7620,  6100,  4904,  3906,  // nice -10 to -6
++//     3121,  2501,  1991,  1586,  1277,  // nice -5 to -1
++//     1024,  820,   655,   526,   423,   // nice 0 to 4
++//     335,   272,   215,   172,   137,   // nice 5 to 9
++//     110,   87,    70,    56,    45,    // nice 10 to 14
++//     36,    29,    23,    18,    15     // nice 15 to 19
++// };
++// #endif
++
++// // Allocate a page for each process's kernel stack.
++// // Map it high in memory, followed by an invalid
++// // guard page.
++// void
++// proc_mapstacks(pagetable_t kpgtbl)
++// {
++//   struct proc *p;
++  
++//   for(p = proc; p < &proc[NPROC]; p++) {
++//     char *pa = kalloc();
++//     if(pa == 0)
++//       panic("kalloc");
++//     uint64 va = KSTACK((int) (p - proc));
++//     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
++//   }
++// }
++
++// // initialize the proc table.
++// void
++// procinit(void)
++// {
++//   struct proc *p;
++  
++//   initlock(&pid_lock, "nextpid");
++//   initlock(&wait_lock, "wait_lock");
++//   for(p = proc; p < &proc[NPROC]; p++) {
++//       initlock(&p->lock, "proc");
++//       p->state = UNUSED;
++//       p->kstack = KSTACK((int) (p - proc));
++//   }
++// }
++
++// // Must be called with interrupts disabled,
++// // to prevent race with process being moved
++// // to a different CPU.
++// int
++// cpuid()
++// {
++//   int id = r_tp();
++//   return id;
++// }
++
++// // Return this CPU's cpu struct.
++// // Interrupts must be disabled.
++// struct cpu*
++// mycpu(void)
++// {
++//   int id = cpuid();
++//   struct cpu *c = &cpus[id];
++//   return c;
++// }
++
++// // Return the current struct proc *, or zero if none.
++// struct proc*
++// myproc(void)
++// {
++//   push_off();
++//   struct cpu *c = mycpu();
++//   struct proc *p = c->proc;
++//   pop_off();
++//   return p;
++// }
++
++// int
++// allocpid()
++// {
++//   int pid;
++  
++//   acquire(&pid_lock);
++//   pid = nextpid;
++//   nextpid = nextpid + 1;
++//   release(&pid_lock);
++
++//   return pid;
++// }
++
++// // Look in the process table for an UNUSED proc.
++// // If found, initialize state required to run in the kernel,
++// // and return with p->lock held.
++// // If there are no free procs, or a memory allocation fails, return 0.
++// static struct proc*
++// allocproc(void)
++// {
++//   struct proc *p;
++
++//   for(p = proc; p < &proc[NPROC]; p++) {
++//     acquire(&p->lock);
++//     if(p->state == UNUSED) {
++//       goto found;
++//     } else {
++//       release(&p->lock);
++//     }
++//   }
++//   return 0;
++
++// found:
++//   p->pid = allocpid();
++//   p->state = USED;
++
++// #ifdef CFS
++//   // Initialize CFS-specific fields
++//   p->nice = NICE_DEFAULT;
++//   p->vruntime = 0; 
++//   p->time_slice = 0;
++//   p->ticks_in_slice = 0;
++//   // Initialize performance stat fields
++//   p->creation_time = ticks;
++//   p->run_ticks = 0;
++//   p->sleep_ticks = 0;
++//   p->sleep_start_time = 0;
++// #endif
++
++//   // Allocate a trapframe page.
++//   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
++//     freeproc(p);
++//     release(&p->lock);
++//     return 0;
++//   }
++
++//   // An empty user page table.
++//   p->pagetable = proc_pagetable(p);
++//   if(p->pagetable == 0){
++//     freeproc(p);
++//     release(&p->lock);
++//     return 0;
++//   }
++
++//   // Set up new context to start executing at forkret,
++//   // which returns to user space.
++//   memset(&p->context, 0, sizeof(p->context));
++//   p->context.ra = (uint64)forkret;
++//   p->context.sp = p->kstack + PGSIZE;
++
++//   return p;
++// }
++
++// // free a proc structure and the data hanging from it,
++// // including user pages.
++// // p->lock must be held.
++// static void
++// freeproc(struct proc *p)
++// {
++//   if(p->trapframe)
++//     kfree((void*)p->trapframe);
++//   p->trapframe = 0;
++//   if(p->pagetable)
++//     proc_freepagetable(p->pagetable, p->sz);
++//   p->pagetable = 0;
++//   p->sz = 0;
++//   p->pid = 0;
++//   p->parent = 0;
++//   p->name[0] = 0;
++//   p->chan = 0;
++//   p->killed = 0;
++//   p->xstate = 0;
++//   p->state = UNUSED;
++// }
++
++// // Create a user page table for a given process, with no user memory,
++// // but with trampoline and trapframe pages.
++// pagetable_t
++// proc_pagetable(struct proc *p)
++// {
++//   pagetable_t pagetable;
++
++//   // An empty page table.
++//   pagetable = uvmcreate();
++//   if(pagetable == 0)
++//     return 0;
++
++//   // map the trampoline code (for system call return)
++//   // at the highest user virtual address.
++//   // only the supervisor uses it, on the way
++//   // to/from user space, so not PTE_U.
++//   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
++//               (uint64)trampoline, PTE_R | PTE_X) < 0){
++//     uvmfree(pagetable, 0);
++//     return 0;
++//   }
++
++//   // map the trapframe page just below the trampoline page, for
++//   // trampoline.S.
++//   if(mappages(pagetable, TRAPFRAME, PGSIZE,
++//               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
++//     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++//     uvmfree(pagetable, 0);
++//     return 0;
++//   }
++
++//   return pagetable;
++// }
++
++// // Free a process's page table, and free the
++// // physical memory it refers to.
++// void
++// proc_freepagetable(pagetable_t pagetable, uint64 sz)
++// {
++//   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++//   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++//   uvmfree(pagetable, sz);
++// }
++
++// // Set up first user process.
++// void
++// userinit(void)
++// {
++//   struct proc *p;
++
++//   p = allocproc();
++//   initproc = p;
++  
++//   p->cwd = namei("/");
++
++//   p->state = RUNNABLE;
++
++//   release(&p->lock);
++// }
++
++// // Shrink user memory by n bytes.
++// // Return 0 on success, -1 on failure.
++// int
++// growproc(int n)
++// {
++//   uint64 sz;
++//   struct proc *p = myproc();
++
++//   sz = p->sz;
++//   if(n > 0){
++//     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++//       return -1;
++//     }
++//   } else if(n < 0){
++//     sz = uvmdealloc(p->pagetable, sz, sz + n);
++//   }
++//   p->sz = sz;
++//   return 0;
++// }
++
++// // Create a new process, copying the parent.
++// // Sets up child kernel stack to return as if from fork() system call.
++// int
++// kfork(void)
++// {
++//   int i, pid;
++//   struct proc *np;
++//   struct proc *p = myproc();
++
++//   // Allocate process.
++//   if((np = allocproc()) == 0){
++//     return -1;
++//   }
++
++//   // Copy user memory from parent to child.
++//   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++//     freeproc(np);
++//     release(&np->lock);
++//     return -1;
++//   }
++//   np->sz = p->sz;
++
++//   // copy saved user registers.
++//   *(np->trapframe) = *(p->trapframe);
++
++//   // Cause fork to return 0 in the child.
++//   np->trapframe->a0 = 0;
++
++//   // increment reference counts on open file descriptors.
++//   for(i = 0; i < NOFILE; i++)
++//     if(p->ofile[i])
++//       np->ofile[i] = filedup(p->ofile[i]);
++//   np->cwd = idup(p->cwd);
++
++//   safestrcpy(np->name, p->name, sizeof(p->name));
++
++//   pid = np->pid;
++
++//   release(&np->lock);
++
++//   acquire(&wait_lock);
++//   np->parent = p;
++//   release(&wait_lock);
++
++//   acquire(&np->lock);
++//   np->state = RUNNABLE;
++//   release(&np->lock);
++
++//   return pid;
++// }
++
++// // Pass p's abandoned children to init.
++// // Caller must hold wait_lock.
++// void
++// reparent(struct proc *p)
++// {
++//   struct proc *pp;
++
++//   for(pp = proc; pp < &proc[NPROC]; pp++){
++//     if(pp->parent == p){
++//       pp->parent = initproc;
++//       wakeup(initproc);
++//     }
++//   }
++// }
++
++// // Exit the current process.  Does not return.
++// // An exited process remains in the zombie state
++// // until its parent calls wait().
++// void
++// kexit(int status)
++// {
++//   struct proc *p = myproc();
++
++//   if(p == initproc)
++//     panic("init exiting");
++
++//   // Close all open files.
++//   for(int fd = 0; fd < NOFILE; fd++){
++//     if(p->ofile[fd]){
++//       struct file *f = p->ofile[fd];
++//       fileclose(f);
++//       p->ofile[fd] = 0;
++//     }
++//   }
++
++//   begin_op();
++//   iput(p->cwd);
++//   end_op();
++//   p->cwd = 0;
++
++//   acquire(&wait_lock);
++
++//   // Give any children to init.
++//   reparent(p);
++
++//   // Parent might be sleeping in wait().
++//   wakeup(p->parent);
++  
++//   acquire(&p->lock);
++
++//   p->xstate = status;
++//   p->state = ZOMBIE;
++
++//   release(&wait_lock);
++
++//   // Jump into the scheduler, never to return.
++//   sched();
++//   panic("zombie exit");
++// }
++
++// // Wait for a child process to exit and return its pid.
++// // Return -1 if this process has no children.
++// int
++// kwait(uint64 addr)
++// {
++//   struct proc *pp;
++//   int havekids, pid;
++//   struct proc *p = myproc();
++
++//   acquire(&wait_lock);
++
++//   for(;;){
++//     // Scan through table looking for exited children.
++//     havekids = 0;
++//     for(pp = proc; pp < &proc[NPROC]; pp++){
++//       if(pp->parent == p){
++//         // make sure the child isn't still in exit() or swtch().
++//         acquire(&pp->lock);
++
++//         havekids = 1;
++//         if(pp->state == ZOMBIE){
++//           // Found one.
++//           pid = pp->pid;
++//           if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
++//                                   sizeof(pp->xstate)) < 0) {
++//             release(&pp->lock);
++//             release(&wait_lock);
++//             return -1;
++//           }
++//           freeproc(pp);
++//           release(&pp->lock);
++//           release(&wait_lock);
++//           return pid;
++//         }
++//         release(&pp->lock);
++//       }
++//     }
++
++//     // No point waiting if we don't have any children.
++//     if(!havekids || killed(p)){
++//       release(&wait_lock);
++//       return -1;
++//     }
++    
++//     // Wait for a child to exit.
++//     sleep(p, &wait_lock);  //DOC: wait-sleep
++//   }
++// }
++
++// // Per-CPU process scheduler.
++// // Each CPU calls scheduler() after setting itself up.
++// // Scheduler never returns.  It loops, doing:
++// //  - choose a process to run.
++// //  - swtch to start running that process.
++// //  - eventually that process transfers control
++// //    via swtch back to the scheduler.
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++
++//   c->proc = 0;
++//   for(;;){
++//     // Avoid deadlock by ensuring interrupts are enabled.
++//     intr_on();
++
++// #ifdef CFS
++//     // Completely Fair Scheduler (CFS)
++//     struct proc *min_vruntime_proc = 0;
++//     int runnable_procs = 0;
++
++//     // First, count the number of runnable processes to calculate the time slice.
++//     // This is a bit racy, but an approximation is fine for the slice calculation.
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         if (p->state == RUNNABLE) {
++//             runnable_procs++;
++//         }
++//     }
++
++//     if (runnable_procs > 0) {
++        
++
++//         /******************** SCHEDULER LOGGING ********************/
++//         printf("\n[Scheduler Tick]\n");
++//         struct proc* log_p;
++//         for (log_p = proc; log_p < &proc[NPROC]; log_p++) {
++//             // A lock isn't strictly needed for this debug print, but it's safer.
++//             acquire(&log_p->lock);
++//             if (log_p->state == RUNNABLE) {
++//                 printf("PID: %d | vRuntime: %lu\n", log_p->pid, log_p->vruntime);
++//             }
++//             release(&log_p->lock);
++//         }
++//         /***********************************************************/
++
++// // Find the runnable process with the minimum vruntime.
++//         // This is also racy but serves to pick a candidate.
++//         for (p = proc; p < &proc[NPROC]; p++) {
++//             if (p->state == RUNNABLE) {
++//                 if (min_vruntime_proc == 0 || p->vruntime < min_vruntime_proc->vruntime) {
++//                     min_vruntime_proc = p;
++//                 }
++//             }
++//         }
++        
++//         if (min_vruntime_proc) {
++//           printf("--> Scheduling PID %d (lowest vRuntime)\n", min_vruntime_proc->pid);
++//             p = min_vruntime_proc;
++//             acquire(&p->lock);
++//             // Re-check state after acquiring the lock.
++//             if (p->state == RUNNABLE) {
++//                 // Calculate time slice for this process.
++//                 uint slice = TARGET_LATENCY / runnable_procs;
++//                 p->time_slice = (slice < MIN_SLICE) ? MIN_SLICE : slice;
++//                 p->ticks_in_slice = 0;
++
++//                 // Switch to chosen process.
++//                 p->state = RUNNING;
++//                 c->proc = p;
++//                 swtch(&c->context, &p->context);
++
++//                 // Process is done running for now.
++//                 c->proc = 0;
++//             }
++//             release(&p->lock);
++//         }
++//     } else {
++//         // Nothing to run. Wait for an interrupt.
++//         asm volatile("wfi");
++//     }
++
++// #else
++//     // Default Round-Robin Scheduler
++//     int found = 0;
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         // Switch to chosen process.  It is the process's job
++//         // to release its lock and then reacquire it
++//         // before jumping back to us.
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++
++//         // Process is done running for now.
++//         // It should have changed its p->state before coming back.
++//         c->proc = 0;
++//         found = 1;
++//       }
++//       release(&p->lock);
++//     }
++//     if(found == 0) {
++//       asm volatile("wfi");
++//     }
++// #endif
++//   }
++// }
++
++// // Switch to scheduler.  Must hold only p->lock
++// // and have changed proc->state. Saves and restores
++// // intena because intena is a property of this
++// // kernel thread, not this CPU. It should
++// // be proc->intena and proc->noff, but that would
++// // break in the few places where a lock is held but
++// // there's no process.
++// void
++// sched(void)
++// {
++//   int intena;
++//   struct proc *p = myproc();
++
++//   if(!holding(&p->lock))
++//     panic("sched p->lock");
++//   if(mycpu()->noff != 1)
++//     panic("sched locks");
++//   if(p->state == RUNNING)
++//     panic("sched RUNNING");
++//   if(intr_get())
++//     panic("sched interruptible");
++
++//   intena = mycpu()->intena;
++//   swtch(&p->context, &mycpu()->context);
++//   mycpu()->intena = intena;
++// }
++
++// // Give up the CPU for one scheduling round.
++// void
++// yield(void)
++// {
++//   struct proc *p = myproc();
++//   acquire(&p->lock);
++//   p->state = RUNNABLE;
++//   sched();
++//   release(&p->lock);
++// }
++
++// // A fork child's very first scheduling by scheduler()
++// // will swtch to forkret.
++// void
++// forkret(void)
++// {
++//   extern char userret[];
++//   static int first = 1;
++//   struct proc *p = myproc();
++
++//   // Still holding p->lock from scheduler.
++//   release(&p->lock);
++
++//   if (first) {
++//     // File system initialization must be run in the context of a
++//     // regular process (e.g., because it calls sleep), and thus cannot
++//     // be run from main().
++//     fsinit(ROOTDEV);
++
++//     first = 0;
++//     // ensure other cores see first=0.
++//     __sync_synchronize();
++
++//     // We can invoke kexec() now that file system is initialized.
++//     // Put the return value (argc) of kexec into a0.
++//     p->trapframe->a0 = kexec("/init", (char *[]){ "/init", 0 });
++//     if (p->trapframe->a0 == -1) {
++//       panic("exec");
++//     }
++//   }
++
++//   // return to user space, mimicing usertrap()'s return.
++//   prepare_return();
++//   uint64 satp = MAKE_SATP(p->pagetable);
++//   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
++//   ((void (*)(uint64))trampoline_userret)(satp);
++// }
++
++// // Sleep on channel chan, releasing condition lock lk.
++// // Re-acquires lk when awakened.
++// // void
++// // sleep(void *chan, struct spinlock *lk)
++// // {
++// //   struct proc *p = myproc();
++  
++// //   // Must acquire p->lock in order to
++// //   // change p->state and then call sched.
++// //   // Once we hold p->lock, we can be
++// //   // guaranteed that we won't miss any wakeup
++// //   // (wakeup locks p->lock),
++// //   // so it's okay to release lk.
+ 
+-  printf("\n");
+-  for(p = proc; p < &proc[NPROC]; p++){
+-    if(p->state == UNUSED)
+-      continue;
+-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+-      state = states[p->state];
+-    else
+-      state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
+-    printf("\n");
+-  }
+-}
++// //   acquire(&p->lock);  //DOC: sleeplock1
++// //   release(lk);
++
++// //   // Go to sleep.
++// //   p->chan = chan;
++// //   p->state = SLEEPING;
++
++// //   sched();
++
++// //   // Tidy up.
++// //   p->chan = 0;
++
++// //   // Reacquire original lock.
++// //   release(&p->lock);
++// //   acquire(lk);
++// // }
++
++// // In kernel/proc.c
++
++// void
++// sleep(void *chan, struct spinlock *lk)
++// {
++//   struct proc *p = myproc();
++  
++//   // Must acquire p->lock in order to
++//   // change p->state and then call sched.
++//   // Once we hold p->lock, we can be
++//   // guaranteed that we won't miss any wakeup
++//   // (wakeup locks p->lock),
++//   // so it's okay to release lk.
++
++//   acquire(&p->lock);  //DOC: sleeplock1
++//   release(lk);
++
++//   // Go to sleep.
++//   p->chan = chan;
++
++// #ifdef CFS
++//   // Record the time just before changing the state to SLEEPING.
++//   p->sleep_start_time = ticks;
++// #endif
++
++//   p->state = SLEEPING;
++
++//   sched();
++
++//   // Tidy up.
++//   p->chan = 0;
++
++//   // Reacquire original lock.
++//   release(&p->lock);
++//   acquire(lk);
++// }
++
++// // Wake up all processes sleeping on channel chan.
++// // Caller should hold the condition lock.
++// void
++// wakeup(void *chan)
++// {
++//   struct proc *p;
++
++//   for(p = proc; p < &proc[NPROC]; p++) {
++//     if(p != myproc()){
++//       acquire(&p->lock);
++//       if(p->state == SLEEPING && p->chan == chan) {
++//         #ifdef CFS
++//         p->sleep_ticks += ticks - p->sleep_start_time;
++//         #endif
++//         p->state = RUNNABLE;
++//       }
++//       release(&p->lock);
++//     }
++//   }
++// }
++
++// // Kill the process with the given pid.
++// // The victim won't exit until it tries to return
++// // to user space (see usertrap() in trap.c).
++// int
++// kkill(int pid)
++// {
++//   struct proc *p;
++
++//   for(p = proc; p < &proc[NPROC]; p++){
++//     acquire(&p->lock);
++//     if(p->pid == pid){
++//       p->killed = 1;
++//       if(p->state == SLEEPING){
++//         // Wake process from sleep().
++//         p->state = RUNNABLE;
++//       }
++//       release(&p->lock);
++//       return 0;
++//     }
++//     release(&p->lock);
++//   }
++//   return -1;
++// }
++
++// void
++// setkilled(struct proc *p)
++// {
++//   acquire(&p->lock);
++//   p->killed = 1;
++//   release(&p->lock);
++// }
++
++// int
++// killed(struct proc *p)
++// {
++//   int k;
++  
++//   acquire(&p->lock);
++//   k = p->killed;
++//   release(&p->lock);
++//   return k;
++// }
++
++// // Copy to either a user address, or kernel address,
++// // depending on usr_dst.
++// // Returns 0 on success, -1 on error.
++// int
++// either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
++// {
++//   struct proc *p = myproc();
++//   if(user_dst){
++//     return copyout(p->pagetable, dst, src, len);
++//   } else {
++//     memmove((char *)dst, src, len);
++//     return 0;
++//   }
++// }
++
++// // Copy from either a user address, or kernel address,
++// // depending on usr_src.
++// // Returns 0 on success, -1 on error.
++// int
++// either_copyin(void *dst, int user_src, uint64 src, uint64 len)
++// {
++//   struct proc *p = myproc();
++//   if(user_src){
++//     return copyin(p->pagetable, dst, src, len);
++//   } else {
++//     memmove(dst, (char*)src, len);
++//     return 0;
++//   }
++// }
++
++// // Print a process listing to console.  For debugging.
++// // Runs when user types ^P on console.
++// // No lock to avoid wedging a stuck machine further.
++// void
++// procdump(void)
++// {
++//   static char *states[] = {
++//   [UNUSED]    "unused",
++//   [USED]      "used",
++//   [SLEEPING]  "sleep ",
++//   [RUNNABLE]  "runble",
++//   [RUNNING]   "run   ",
++//   [ZOMBIE]    "zombie"
++//   };
++//   struct proc *p;
++//   char *state;
++
++//   printf("\n");
++//   for(p = proc; p < &proc[NPROC]; p++){
++//     if(p->state == UNUSED)
++//       continue;
++//     if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
++//       state = states[p->state];
++//     else
++//       state = "???";
++
++// #ifdef CFS
++//     // For CFS, print nice value and vruntime
++//     printf("%d %s %s nice:%d vruntime:%lu", p->pid, state, p->name, p->nice, p->vruntime);
++// #else
++//     // Default print
++//     printf("%d %s %s", p->pid, state, p->name);
++// #endif
++
++//     printf("\n");
++//   }
++// }
++
++// #ifdef CFS
++// // This function is called from trap.c on every timer tick for the running process.
++// void
++// update_runtime(void)
++// {
++//   struct proc *p = myproc();
++//   if(p == 0)
++//     return;
++  
++
++// // --- DEBUG PRINT ---
++//   printf("[DEBUG] update_runtime: Entered for PID %d.\n", p->pid);
++
++//   acquire(&p->lock);
++//   if(p->state == RUNNING) {
++//     p->ticks_in_slice++;
++//     p->run_ticks++; // Increment total running time
++//     // Update vruntime based on nice value (weight).
++//     // The increment is scaled to preserve precision with integer math.
++//     int weight = nice_to_weight[p->nice + 20];
++//     if (weight == 0) weight = 1; // Should not happen but good practice
++//     uint64 increment = (WEIGHT_SCALE * 1024) / weight;
++//      // --- DEBUG PRINT ---
++//     printf("[DEBUG] update_runtime: PID %d | old_vRuntime: %lu | increment: %lu\n", p->pid, p->vruntime, increment);
++//     p->vruntime += increment;  
++//   }
++//   release(&p->lock);
++// }
++// #endif
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..0739dca 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -41,19 +41,19 @@ extern struct cpu cpus[NCPU];
+ // return-to-user path via usertrapret() doesn't return through
+ // the entire kernel call stack.
+ struct trapframe {
+-  /*   0 */ uint64 kernel_satp;   // kernel page table
+-  /*   8 */ uint64 kernel_sp;     // top of process's kernel stack
+-  /*  16 */ uint64 kernel_trap;   // usertrap()
+-  /*  24 */ uint64 epc;           // saved user program counter
+-  /*  32 */ uint64 kernel_hartid; // saved kernel tp
+-  /*  40 */ uint64 ra;
+-  /*  48 */ uint64 sp;
+-  /*  56 */ uint64 gp;
+-  /*  64 */ uint64 tp;
+-  /*  72 */ uint64 t0;
+-  /*  80 */ uint64 t1;
+-  /*  88 */ uint64 t2;
+-  /*  96 */ uint64 s0;
++  /* 0 */ uint64 kernel_satp;   // kernel page table
++  /* 8 */ uint64 kernel_sp;     // top of process's kernel stack
++  /* 16 */ uint64 kernel_trap;   // usertrap()
++  /* 24 */ uint64 epc;           // saved user program counter
++  /* 32 */ uint64 kernel_hartid; // saved kernel tp
++  /* 40 */ uint64 ra;
++  /* 48 */ uint64 sp;
++  /* 56 */ uint64 gp;
++  /* 64 */ uint64 tp;
++  /* 72 */ uint64 t0;
++  /* 80 */ uint64 t1;
++  /* 88 */ uint64 t2;
++  /* 96 */ uint64 s0;
+   /* 104 */ uint64 s1;
+   /* 112 */ uint64 a0;
+   /* 120 */ uint64 a1;
+@@ -81,10 +81,19 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++#ifdef CFS
++#define NICE_DEFAULT 0
++#define TARGET_LATENCY 48
++#define MIN_SLICE 3
++#define WEIGHT_SCALE 100
++
++// Declare the nice_to_weight array so other files can use it
++extern const int nice_to_weight[40];
++#endif
++
+ // Per-process state
+ struct proc {
+-  struct spinlock lock;
+-
++  struct spinlock lock; 
+   // p->lock must be held when using these:
+   enum procstate state;        // Process state
+   void *chan;                  // If non-zero, sleeping on chan
+@@ -104,4 +113,30 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  #ifdef CFS
++  int nice;                    // Nice value for priority: -20 to 19
++  uint64 vruntime;             // Virtual runtime, scaled for integer math
++  uint time_slice;             // Calculated time slice for this process
++  uint ticks_in_slice;         // Ticks consumed in the current time slice
++  #endif
++
++// Fields for performance stats and FCFS
++  #if defined(CFS) || defined(FCFS)
++  // Fields for performance stats
++  uint creation_time;          // Time when the process was created
++  #endif
++
++#ifdef MLFQ
++  int priority_queue;     // Current priority queue (0-3)
++  int ticks_in_slice;     // Ticks consumed in the current time slice
++  uint creation_time;      // To order processes within a queue
++#endif
++
++#ifdef CFS
++  uint run_ticks;              // Total ticks spent in RUNNING state
++  uint sleep_ticks;            // Total ticks spent in SLEEPING state
++  uint sleep_start_time;       // The time when the process started sleeping
++#endif
+ };
++extern struct proc proc[NPROC];
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..6470bd3 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -7,6 +7,12 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
++
++
++uint global_read_count = 0;
++struct spinlock read_count_lock;
++
++
+ // Fetch the uint64 at addr from the current process.
+ int
+ fetchaddr(uint64 addr, uint64 *ip)
+@@ -101,6 +107,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_proc_stats(void);
++extern uint64 sys_getreadcount(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +134,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_proc_stats] sys_proc_stats,
++[SYS_getreadcount] sys_getreadcount,
+ };
+ 
+ void
+@@ -145,3 +155,12 @@ syscall(void)
+     p->trapframe->a0 = -1;
+   }
+ }
++
++// Add this function if it doesn't exist
++void
++syscall_init(void)
++{
++  initlock(&read_count_lock, "read_count_lock");
++}
++
++
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..49254d9 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_proc_stats 22
++#define SYS_getreadcount 23
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index d8234ce..bbc3ff6 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -65,6 +65,11 @@ sys_dup(void)
+   return fd;
+ }
+ 
++// Add extern declarations at the top of the file
++extern uint global_read_count;
++extern struct spinlock read_count_lock;
++
++// Find the sys_read function and modify it
+ uint64
+ sys_read(void)
+ {
+@@ -76,7 +81,23 @@ sys_read(void)
+   argint(2, &n);
+   if(argfd(0, 0, &f) < 0)
+     return -1;
+-  return fileread(f, p, n);
++  
++  if(f->readable == 0)
++    return -1;
++
++  int bytes_read = fileread(f, p, n);
++  
++  if(bytes_read > 0) {
++    acquire(&read_count_lock);
++    global_read_count += bytes_read;
++    // Handle overflow as requested
++    if (global_read_count < bytes_read) {
++        global_read_count = bytes_read; // or handle as appropriate
++    }
++    release(&read_count_lock);
++  }
++
++  return bytes_read;
+ }
+ 
+ uint64
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3044d00..749a79f 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,10 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "vm.h"
++extern uint ticks; // For getting final time
++extern uint global_read_count;
++extern struct spinlock read_count_lock;
++
+ 
+ uint64
+ sys_exit(void)
+@@ -105,3 +109,94 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_getreadcount(void)
++{
++  uint count;
++  acquire(&read_count_lock);
++  count = global_read_count;
++  release(&read_count_lock);
++  return count;
++}
++
++uint64
++sys_proc_stats(void)
++{
++#ifdef CFS
++    uint total_wait = 0;
++    uint total_run = 0;
++    int num_procs = 0;
++    struct proc *p;
++
++    printf("\n--- CFS Process Stats ---\n");
++
++    // Iterate through all processes to find finished children of the test
++    for (p = proc; p < &proc[NPROC]; p++) {
++        // We look for ZOMBIE states as they have exited but not been cleaned up yet.
++        // PIDs > 2 are used to skip init and the shell.
++        if (p->pid > 2 && p->creation_time > 0) { 
++            if(p->state == ZOMBIE || p->state == UNUSED) {
++                uint turnaround_time = ticks - p->creation_time;
++                uint wait_time = turnaround_time - p->run_ticks - p->sleep_ticks;
++
++                total_wait += wait_time;
++                total_run += p->run_ticks;
++                num_procs++;
++            }
++        }
++    }
++
++    if (num_procs > 0) {
++        printf("Total test processes finished: %d\n", num_procs);
++        printf("Average Waiting Time: %d ticks\n", total_wait / num_procs);
++        printf("Average Running Time: %d ticks\n", total_run / num_procs);
++    } else {
++        printf("No completed test processes to calculate stats.\n");
++    }
++    printf("---------------------\n");
++#else
++    // If not using CFS, print a message indicating stats are not supported.
++    printf("\nProcess statistics are only available for the CFS scheduler.\n");
++#endif
++    return 0;
++}
++
++
++// uint64
++// sys_proc_stats(void)
++// {
++//     uint total_wait = 0;
++//     uint total_run = 0;
++//     int num_procs = 0;
++//     struct proc *p;
++
++//     printf("\n--- Process Stats ---\n");
++
++//     // Iterate through all processes to find finished children of the test
++//     for (p = proc; p < &proc[NPROC]; p++) {
++//         // We look for ZOMBIE states as they have exited but not been cleaned up yet.
++//         // PIDs > 2 are used to skip init and the shell.
++//         if (p->pid > 2 && p->creation_time > 0) { 
++//             if(p->state == ZOMBIE || p->state == UNUSED) {
++//                 uint turnaround_time = ticks - p->creation_time;
++//                 uint wait_time = turnaround_time - p->run_ticks - p->sleep_ticks;
++
++//                 total_wait += wait_time;
++//                 total_run += p->run_ticks;
++//                 num_procs++;
++//             }
++//         }
++//     }
++
++//     if (num_procs > 0) {
++//         printf("Total test processes finished: %d\n", num_procs);
++//         printf("Average Waiting Time: %d ticks\n", total_wait / num_procs);
++//         printf("Average Running Time: %d ticks\n", total_run / num_procs);
++//     } else {
++//         printf("No completed test processes to calculate stats.\n");
++//     }
++//     printf("---------------------\n");
++//     return 0;
++// }
++
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a41cd69..2eca99d 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -10,206 +10,207 @@ struct spinlock tickslock;
+ uint ticks;
+ 
+ extern char trampoline[], uservec[];
+-
+-// in kernelvec.S, calls kerneltrap().
+-void kernelvec();
+-
++extern void kernelvec();
+ extern int devintr();
+ 
+-void
+-trapinit(void)
+-{
+-  initlock(&tickslock, "time");
+-}
++extern uint boost_timer; // Declare the global boost timer
++extern const int time_slices[4]; // Declare the time slices array
+ 
+-// set up to take exceptions and traps while in the kernel.
+-void
+-trapinithart(void)
+-{
+-  w_stvec((uint64)kernelvec);
+-}
++void trapinit(void) { initlock(&tickslock, "time"); }
++void trapinithart(void) { w_stvec((uint64)kernelvec); }
+ 
+-//
+-// handle an interrupt, exception, or system call from user space.
+-// called from, and returns to, trampoline.S
+-// return value is user satp for trampoline.S to switch to.
+-//
+-uint64
+-usertrap(void)
+-{
++uint64 usertrap(void) {
+   int which_dev = 0;
++  if((r_sstatus() & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
+ 
+-  if((r_sstatus() & SSTATUS_SPP) != 0)
+-    panic("usertrap: not from user mode");
+-
+-  // send interrupts and exceptions to kerneltrap(),
+-  // since we're now in the kernel.
+-  w_stvec((uint64)kernelvec);  //DOC: kernelvec
+-
++  w_stvec((uint64)kernelvec);
+   struct proc *p = myproc();
+-  
+-  // save user program counter.
+   p->trapframe->epc = r_sepc();
+   
+   if(r_scause() == 8){
+-    // system call
+-
+-    if(killed(p))
+-      kexit(-1);
+-
+-    // sepc points to the ecall instruction,
+-    // but we want to return to the next instruction.
++    if(killed(p)) kexit(-1);
+     p->trapframe->epc += 4;
+-
+-    // an interrupt will change sepc, scause, and sstatus,
+-    // so enable only now that we're done with those registers.
+     intr_on();
+-
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else if((r_scause() == 15 || r_scause() == 13) &&
+-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
+-    // page fault on lazily-allocated page
+   } else {
+     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+     setkilled(p);
+   }
+ 
+-  if(killed(p))
+-    kexit(-1);
++  if(killed(p)) kexit(-1);
++
++#ifdef CFS
++  if(which_dev == 2) {
++    acquire(&p->lock);
++    p->ticks_in_slice++;
++    p->run_ticks++;
++    int weight = nice_to_weight[p->nice + 20];
++    if (weight == 0) weight = 1;
++    p->vruntime += (WEIGHT_SCALE * 1024) / weight;
++
++    if (p->ticks_in_slice >= p->time_slice) {
++      release(&p->lock);
++      yield();
++    } else {
++      release(&p->lock);
++    }
++  }
++#elif defined(FCFS)
++  // For FCFS, do nothing on a timer interrupt. It is non-preemptive.
++  if(which_dev == 2) {
++    // Intentionally left blank.
++  }
++#elif defined(MLFQ)
++  // --- MLFQ Timer Tick Logic ---
++  if(which_dev == 2) {
++    int expired = 0, preempt = 0;
++    
++    acquire(&p->lock);
++    p->ticks_in_slice++;
++    if(p->ticks_in_slice >= time_slices[p->priority_queue]) {
++        expired = 1;
++        if(p->priority_queue < 3) p->priority_queue++; // Demote
++        p->ticks_in_slice = 0;
++    }
++    release(&p->lock);
++
++    // If slice didn't expire, check if a higher-priority process is ready
++    if(!expired) {
++        struct proc *q;
++        for(q = proc; q < &proc[NPROC]; q++) {
++            if(q->state == RUNNABLE && q->priority_queue < p->priority_queue) {
++                preempt = 1;
++                break;
++            }
++        }
++    }
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
+-    yield();
++    if(expired || preempt) {
++        yield();
++    }
++  }
++#else
++  if(which_dev == 2) yield();
++#endif
+ 
+   prepare_return();
+-
+-  // the user page table to switch to, for trampoline.S
+-  uint64 satp = MAKE_SATP(p->pagetable);
+-
+-  // return to trampoline.S; satp value in a0.
+-  return satp;
++  return MAKE_SATP(p->pagetable);
+ }
+ 
+-//
+-// set up trapframe and control registers for a return to user space
+-//
+-void
+-prepare_return(void)
+-{
++void prepare_return(void) {
+   struct proc *p = myproc();
+-
+-  // we're about to switch the destination of traps from
+-  // kerneltrap() to usertrap(). because a trap from kernel
+-  // code to usertrap would be a disaster, turn off interrupts.
+   intr_off();
+-
+-  // send syscalls, interrupts, and exceptions to uservec in trampoline.S
+   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+   w_stvec(trampoline_uservec);
+-
+-  // set up trapframe values that uservec will need when
+-  // the process next traps into the kernel.
+-  p->trapframe->kernel_satp = r_satp();         // kernel page table
+-  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
++  p->trapframe->kernel_satp = r_satp();
++  p->trapframe->kernel_sp = p->kstack + PGSIZE;
+   p->trapframe->kernel_trap = (uint64)usertrap;
+-  p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
+-
+-  // set up the registers that trampoline.S's sret will use
+-  // to get to user space.
+-  
+-  // set S Previous Privilege mode to User.
++  p->trapframe->kernel_hartid = r_tp();
+   unsigned long x = r_sstatus();
+-  x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
+-  x |= SSTATUS_SPIE; // enable interrupts in user mode
++  x &= ~SSTATUS_SPP;
++  x |= SSTATUS_SPIE;
+   w_sstatus(x);
+-
+-  // set S Exception Program Counter to the saved user pc.
+   w_sepc(p->trapframe->epc);
+ }
+ 
+-// interrupts and exceptions from kernel code go here via kernelvec,
+-// on whatever the current kernel stack is.
+-void 
+-kerneltrap()
+-{
++void kerneltrap() {
+   int which_dev = 0;
+   uint64 sepc = r_sepc();
+   uint64 sstatus = r_sstatus();
+-  uint64 scause = r_scause();
+   
+-  if((sstatus & SSTATUS_SPP) == 0)
+-    panic("kerneltrap: not from supervisor mode");
+-  if(intr_get() != 0)
+-    panic("kerneltrap: interrupts enabled");
++  if((r_sstatus() & SSTATUS_SPP) == 0) panic("kerneltrap: not from supervisor mode");
++  if(intr_get() != 0) panic("kerneltrap: interrupts enabled");
+ 
+   if((which_dev = devintr()) == 0){
+-    // interrupt or trap from an unknown source
+-    printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
++    printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", r_scause(), r_sepc(), r_stval());
+     panic("kerneltrap");
+   }
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2 && myproc() != 0)
+-    yield();
++#ifdef CFS
++  struct proc *p = myproc();
++  if(which_dev == 2 && p != 0 && p->state == RUNNING) {
++      acquire(&p->lock);
++      p->ticks_in_slice++;
++      p->run_ticks++;
++      int weight = nice_to_weight[p->nice + 20];
++      if (weight == 0) weight = 1;
++      p->vruntime += (WEIGHT_SCALE * 1024) / weight;
++
++      if (p->ticks_in_slice >= p->time_slice) {
++          release(&p->lock);
++          yield();
++      } else {
++          release(&p->lock);
++      }
++  }
++#elif defined(FCFS)
++  // For FCFS, do nothing on a timer interrupt. It is non-preemptive.
++  if(which_dev == 2) {
++    // Intentionally left blank.
++  }
++#elif defined(MLFQ)
++  // --- MLFQ Timer Tick Logic ---
++  struct proc *p = myproc();
++  if(which_dev == 2 && p != 0 && p->state == RUNNING) {
++    int expired = 0, preempt = 0;
++    
++    acquire(&p->lock);
++    p->ticks_in_slice++;
++    if(p->ticks_in_slice >= time_slices[p->priority_queue]) {
++        expired = 1;
++        if(p->priority_queue < 3) p->priority_queue++; // Demote
++        p->ticks_in_slice = 0;
++    }
++    release(&p->lock);
++
++    if(!expired) {
++        struct proc *q;
++        for(q = proc; q < &proc[NPROC]; q++) {
++            if(q->state == RUNNABLE && q->priority_queue < p->priority_queue) {
++                preempt = 1;
++                break;
++            }
++        }
++    }
++
++    if(expired || preempt) {
++        yield();
++    }
++  }
++#else
++  if(which_dev == 2 && myproc() != 0) yield();
++#endif
+ 
+-  // the yield() may have caused some traps to occur,
+-  // so restore trap registers for use by kernelvec.S's sepc instruction.
+   w_sepc(sepc);
+   w_sstatus(sstatus);
+ }
+ 
+-void
+-clockintr()
+-{
++void clockintr() {
+   if(cpuid() == 0){
+     acquire(&tickslock);
+     ticks++;
++    #ifdef MLFQ
++    boost_timer++; // Increment priority boost timer
++    #endif
+     wakeup(&ticks);
+     release(&tickslock);
+   }
+-
+-  // ask for the next timer interrupt. this also clears
+-  // the interrupt request. 1000000 is about a tenth
+-  // of a second.
+   w_stimecmp(r_time() + 1000000);
+ }
+ 
+-// check if it's an external interrupt or software interrupt,
+-// and handle it.
+-// returns 2 if timer interrupt,
+-// 1 if other device,
+-// 0 if not recognized.
+-int
+-devintr()
+-{
++int devintr() {
+   uint64 scause = r_scause();
+-
+   if(scause == 0x8000000000000009L){
+-    // this is a supervisor external interrupt, via PLIC.
+-
+-    // irq indicates which device interrupted.
+     int irq = plic_claim();
+-
+-    if(irq == UART0_IRQ){
+-      uartintr();
+-    } else if(irq == VIRTIO0_IRQ){
+-      virtio_disk_intr();
+-    } else if(irq){
+-      printf("unexpected interrupt irq=%d\n", irq);
+-    }
+-
+-    // the PLIC allows each device to raise at most one
+-    // interrupt at a time; tell the PLIC the device is
+-    // now allowed to interrupt again.
+-    if(irq)
+-      plic_complete(irq);
+-
++    if(irq == UART0_IRQ) uartintr();
++    else if(irq == VIRTIO0_IRQ) virtio_disk_intr();
++    else if(irq) printf("unexpected interrupt irq=%d\n", irq);
++    if(irq) plic_complete(irq);
+     return 1;
+   } else if(scause == 0x8000000000000005L){
+-    // timer interrupt.
+     clockintr();
+     return 2;
+   } else {
+@@ -217,3 +218,666 @@ devintr()
+   }
+ }
+ 
++
++// #include "types.h"
++// #include "param.h"
++// #include "memlayout.h"
++// #include "riscv.h"
++// #include "spinlock.h"
++// #include "proc.h"
++// #include "defs.h"
++
++// struct spinlock tickslock;
++// uint ticks;
++
++// extern char trampoline[], uservec[];
++
++// // in kernelvec.S, calls kerneltrap().
++// void kernelvec();
++
++// extern int devintr();
++
++// void
++// trapinit(void)
++// {
++//   initlock(&tickslock, "time");
++// }
++
++// // set up to take exceptions and traps while in the kernel.
++// void
++// trapinithart(void)
++// {
++//   w_stvec((uint64)kernelvec);
++// }
++
++// //
++// // handle an interrupt, exception, or system call from user space.
++// // called from, and returns to, trampoline.S
++// //
++// uint64
++// usertrap(void)
++// {
++//   int which_dev = 0;
++
++//   if((r_sstatus() & SSTATUS_SPP) != 0)
++//     panic("usertrap: not from user mode");
++
++//   w_stvec((uint64)kernelvec);
++
++//   struct proc *p = myproc();
++  
++//   p->trapframe->epc = r_sepc();
++  
++//   if(r_scause() == 8){
++//     if(killed(p))
++//       kexit(-1);
++//     p->trapframe->epc += 4;
++//     intr_on();
++//     syscall();
++//   } else if((which_dev = devintr()) != 0){
++//     // ok
++//   } else if((r_scause() == 15 || r_scause() == 13) &&
++//             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
++//     // page fault
++//   } else {
++//     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
++//     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
++//     setkilled(p);
++//   }
++
++//   if(killed(p))
++//     kexit(-1);
++
++// #ifdef CFS
++//   // For CFS, a timer interrupt updates runtime stats and yields if the time slice is over.
++//   if(which_dev == 2) {
++//     update_runtime();
++//     acquire(&p->lock);
++//     if (p->ticks_in_slice >= p->time_slice) {
++//       release(&p->lock);
++//       yield();
++//     } else {
++//       release(&p->lock);
++//     }
++//   }
++// #else
++//   if(which_dev == 2)
++//     yield();
++// #endif
++
++//   prepare_return();
++//   uint64 satp = MAKE_SATP(p->pagetable);
++//   return satp;
++// }
++
++// void
++// prepare_return(void)
++// {
++//   struct proc *p = myproc();
++//   intr_off();
++//   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
++//   w_stvec(trampoline_uservec);
++//   p->trapframe->kernel_satp = r_satp();
++//   p->trapframe->kernel_sp = p->kstack + PGSIZE;
++//   p->trapframe->kernel_trap = (uint64)usertrap;
++//   p->trapframe->kernel_hartid = r_tp();
++//   unsigned long x = r_sstatus();
++//   x &= ~SSTATUS_SPP;
++//   x |= SSTATUS_SPIE;
++//   w_sstatus(x);
++//   w_sepc(p->trapframe->epc);
++// }
++
++// void 
++// kerneltrap()
++// {
++//   int which_dev = 0;
++//   uint64 sepc = r_sepc();
++//   uint64 sstatus = r_sstatus();
++  
++//   if((r_sstatus() & SSTATUS_SPP) == 0)
++//     panic("kerneltrap: not from supervisor mode");
++//   if(intr_get() != 0)
++//     panic("kerneltrap: interrupts enabled");
++
++//   if((which_dev = devintr()) == 0){
++//     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", r_scause(), r_sepc(), r_stval());
++//     panic("kerneltrap");
++//   }
++
++// #ifdef CFS
++//   // For CFS, update runtime and yield if the slice is over.
++//   struct proc *p = myproc();
++//   if(which_dev == 2 && p != 0 && p->state == RUNNING) {
++//       update_runtime();
++//       acquire(&p->lock);
++//       if (p->ticks_in_slice >= p->time_slice) {
++//           release(&p->lock);
++//           yield();
++//       } else {
++//           release(&p->lock);
++//       }
++//   }
++// #else
++//   // give up the CPU if this is a timer interrupt.
++//   if(which_dev == 2 && myproc() != 0)
++//     yield();
++// #endif
++
++//   w_sepc(sepc);
++//   w_sstatus(sstatus);
++// }
++
++// void
++// clockintr()
++// {
++//   if(cpuid() == 0){
++//     acquire(&tickslock);
++//     ticks++;
++//     wakeup(&ticks);
++//     release(&tickslock);
++//   }
++//   w_stimecmp(r_time() + 1000000);
++// }
++
++// int
++// devintr()
++// {
++//   uint64 scause = r_scause();
++
++//   if(scause == 0x8000000000000009L){
++//     int irq = plic_claim();
++//     if(irq == UART0_IRQ){
++//       uartintr();
++//     } else if(irq == VIRTIO0_IRQ){
++//       virtio_disk_intr();
++//     } else if(irq){
++//       printf("unexpected interrupt irq=%d\n", irq);
++//     }
++//     if(irq)
++//       plic_complete(irq);
++//     return 1;
++//   } else if(scause == 0x8000000000000005L){
++//     clockintr();
++//     return 2;
++//   } else {
++//     return 0;
++//   }
++// }
++
++
++// // #include "types.h"
++// // #include "param.h"
++// // #include "memlayout.h"
++// // #include "riscv.h"
++// // #include "spinlock.h"
++// // #include "proc.h"
++// // #include "defs.h"
++
++// // struct spinlock tickslock;
++// // uint ticks;
++
++// // extern char trampoline[], uservec[];
++
++// // // in kernelvec.S, calls kerneltrap().
++// // void kernelvec();
++
++// // extern int devintr();
++
++// // void
++// // trapinit(void)
++// // {
++// //   initlock(&tickslock, "time");
++// // }
++
++// // // set up to take exceptions and traps while in the kernel.
++// // void
++// // trapinithart(void)
++// // {
++// //   w_stvec((uint64)kernelvec);
++// // }
++
++// // //
++// // // handle an interrupt, exception, or system call from user space.
++// // // called from, and returns to, trampoline.S
++// // // return value is user satp for trampoline.S to switch to.
++// // //
++// // uint64
++// // usertrap(void)
++// // {
++// //   int which_dev = 0;
++
++// //   if((r_sstatus() & SSTATUS_SPP) != 0)
++// //     panic("usertrap: not from user mode");
++
++// //   // send interrupts and exceptions to kerneltrap(),
++// //   // since we're now in the kernel.
++// //   w_stvec((uint64)kernelvec);  //DOC: kernelvec
++
++// //   struct proc *p = myproc();
++  
++// //   // save user program counter.
++// //   p->trapframe->epc = r_sepc();
++  
++// //   if(r_scause() == 8){
++// //     // system call
++
++// //     if(killed(p))
++// //       kexit(-1);
++
++// //     // sepc points to the ecall instruction,
++// //     // but we want to return to the next instruction.
++// //     p->trapframe->epc += 4;
++
++// //     // an interrupt will change sepc, scause, and sstatus,
++// //     // so enable only now that we're done with those registers.
++// //     intr_on();
++
++// //     syscall();
++// //   } else if((which_dev = devintr()) != 0){
++// //     // ok
++// //   } else if((r_scause() == 15 || r_scause() == 13) &&
++// //             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
++// //     // page fault on lazily-allocated page
++// //   } else {
++// //     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
++// //     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
++// //     setkilled(p);
++// //   }
++
++// //   if(killed(p))
++// //     kexit(-1);
++
++// // #ifdef CFS
++// //   // For CFS, a timer interrupt updates runtime stats and yields if the time slice is over.
++// //   if(which_dev == 2) {
++// //      // --- DEBUG PRINT ---
++// //     printf("[DEBUG] usertrap: Timer interrupt detected for PID %d.\n", p->pid);
++// //     update_runtime(); // This will update vruntime and ticks_in_slice
++// //     acquire(&p->lock);
++// //     // Check if time slice has expired.
++// //     if (p->ticks_in_slice >= p->time_slice) {
++// //       release(&p->lock);
++// //       yield();
++// //     } else {
++// //       release(&p->lock);
++// //     }
++// //   }
++// // #else
++// //   // For Round-Robin, yield on every timer interrupt.
++// //   if(which_dev == 2)
++// //     yield();
++// // #endif
++
++// //   prepare_return();
++
++// //   // the user page table to switch to, for trampoline.S
++// //   uint64 satp = MAKE_SATP(p->pagetable);
++
++// //   // return to trampoline.S; satp value in a0.
++// //   return satp;
++// // }
++
++// // //
++// // // set up trapframe and control registers for a return to user space
++// // //
++// // void
++// // prepare_return(void)
++// // {
++// //   struct proc *p = myproc();
++
++// //   // we're about to switch the destination of traps from
++// //   // kerneltrap() to usertrap(). because a trap from kernel
++// //   // code to usertrap would be a disaster, turn off interrupts.
++// //   intr_off();
++
++// //   // send syscalls, interrupts, and exceptions to uservec in trampoline.S
++// //   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
++// //   w_stvec(trampoline_uservec);
++
++// //   // set up trapframe values that uservec will need when
++// //   // the process next traps into the kernel.
++// //   p->trapframe->kernel_satp = r_satp();         // kernel page table
++// //   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
++// //   p->trapframe->kernel_trap = (uint64)usertrap;
++// //   p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
++
++// //   // set up the registers that trampoline.S's sret will use
++// //   // to get to user space.
++  
++// //   // set S Previous Privilege mode to User.
++// //   unsigned long x = r_sstatus();
++// //   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
++// //   x |= SSTATUS_SPIE; // enable interrupts in user mode
++// //   w_sstatus(x);
++
++// //   // set S Exception Program Counter to the saved user pc.
++// //   w_sepc(p->trapframe->epc);
++// // }
++
++// // // interrupts and exceptions from kernel code go here via kernelvec,
++// // // on whatever the current kernel stack is.
++// // void 
++// // kerneltrap()
++// // {
++// //   int which_dev = 0;
++// //   uint64 sepc = r_sepc();
++// //   uint64 sstatus = r_sstatus();
++// //   uint64 scause = r_scause();
++  
++// //   if((sstatus & SSTATUS_SPP) == 0)
++// //     panic("kerneltrap: not from supervisor mode");
++// //   if(intr_get() != 0)
++// //     panic("kerneltrap: interrupts enabled");
++
++// //   if((which_dev = devintr()) == 0){
++// //     // interrupt or trap from an unknown source
++// //     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
++// //     panic("kerneltrap");
++// //   }
++
++// //   // give up the CPU if this is a timer interrupt.
++// //   if(which_dev == 2 && myproc() != 0)
++// //     yield();
++
++// //   // the yield() may have caused some traps to occur,
++// //   // so restore trap registers for use by kernelvec.S's sepc instruction.
++// //   w_sepc(sepc);
++// //   w_sstatus(sstatus);
++// // }
++
++// // void
++// // clockintr()
++// // {
++// //   if(cpuid() == 0){
++// //     acquire(&tickslock);
++// //     ticks++;
++// //     wakeup(&ticks);
++// //     release(&tickslock);
++// //   }
++
++// //   // ask for the next timer interrupt. this also clears
++// //   // the interrupt request. 1000000 is about a tenth
++// //   // of a second.
++// //   w_stimecmp(r_time() + 1000000);
++// // }
++
++// // // check if it's an external interrupt or software interrupt,
++// // // and handle it.
++// // // returns 2 if timer interrupt,
++// // // 1 if other device,
++// // // 0 if not recognized.
++// // int
++// // devintr()
++// // {
++// //   uint64 scause = r_scause();
++// // // --- DEBUG PRINT ---
++// //   printf("[DEBUG] devintr: scause=0x%lx\n", scause);
++// //   if(scause == 0x8000000000000009L){
++// //     // this is a supervisor external interrupt, via PLIC.
++
++// //     // irq indicates which device interrupted.
++// //     int irq = plic_claim();
++
++// //     if(irq == UART0_IRQ){
++// //       uartintr();
++// //     } else if(irq == VIRTIO0_IRQ){
++// //       virtio_disk_intr();
++// //     } else if(irq){
++// //       printf("unexpected interrupt irq=%d\n", irq);
++// //     }
++
++// //     // the PLIC allows each device to raise at most one
++// //     // interrupt at a time; tell the PLIC the device is
++// //     // now allowed to interrupt again.
++// //     if(irq)
++// //       plic_complete(irq);
++
++// //     return 1;
++// //   } else if(scause == 0x8000000000000005L){ // <-- THIS IS THE CORRECTED LINE
++// //     // timer interrupt.
++// //      // --- DEBUG PRINT ---
++// //     printf("[DEBUG] devintr: Timer interrupt confirmed.\n");
++// //     clockintr();
++// //     return 2;
++// //   } else {
++// //     return 0;
++// //   }
++// // }
++
++
++
++
++// // // #include "types.h"
++// // // #include "param.h"
++// // // #include "memlayout.h"
++// // // #include "riscv.h"
++// // // #include "spinlock.h"
++// // // #include "proc.h"
++// // // #include "defs.h"
++
++// // // struct spinlock tickslock;
++// // // uint ticks;
++
++// // // extern char trampoline[], uservec[];
++
++// // // // in kernelvec.S, calls kerneltrap().
++// // // void kernelvec();
++
++// // // extern int devintr();
++
++// // // void
++// // // trapinit(void)
++// // // {
++// // //   initlock(&tickslock, "time");
++// // // }
++
++// // // // set up to take exceptions and traps while in the kernel.
++// // // void
++// // // trapinithart(void)
++// // // {
++// // //   w_stvec((uint64)kernelvec);
++// // // }
++
++// // // //
++// // // // handle an interrupt, exception, or system call from user space.
++// // // // called from, and returns to, trampoline.S
++// // // // return value is user satp for trampoline.S to switch to.
++// // // //
++// // // uint64
++// // // usertrap(void)
++// // // {
++// // //   int which_dev = 0;
++
++// // //   if((r_sstatus() & SSTATUS_SPP) != 0)
++// // //     panic("usertrap: not from user mode");
++
++// // //   // send interrupts and exceptions to kerneltrap(),
++// // //   // since we're now in the kernel.
++// // //   w_stvec((uint64)kernelvec);  //DOC: kernelvec
++
++// // //   struct proc *p = myproc();
++  
++// // //   // save user program counter.
++// // //   p->trapframe->epc = r_sepc();
++  
++// // //   if(r_scause() == 8){
++// // //     // system call
++
++// // //     if(killed(p))
++// // //       kexit(-1);
++
++// // //     // sepc points to the ecall instruction,
++// // //     // but we want to return to the next instruction.
++// // //     p->trapframe->epc += 4;
++
++// // //     // an interrupt will change sepc, scause, and sstatus,
++// // //     // so enable only now that we're done with those registers.
++// // //     intr_on();
++
++// // //     syscall();
++// // //   } else if((which_dev = devintr()) != 0){
++// // //     // ok
++// // //   } else if((r_scause() == 15 || r_scause() == 13) &&
++// // //             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
++// // //     // page fault on lazily-allocated page
++// // //   } else {
++// // //     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
++// // //     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
++// // //     setkilled(p);
++// // //   }
++
++// // //   if(killed(p))
++// // //     kexit(-1);
++
++// // // #ifdef CFS
++// // //   // For CFS, a timer interrupt updates runtime stats and yields if the time slice is over.
++// // //   if(which_dev == 2) {
++// // //     update_runtime(); // This will update vruntime and ticks_in_slice
++// // //     acquire(&p->lock);
++// // //     // Check if time slice has expired.
++// // //     if (p->ticks_in_slice >= p->time_slice) {
++// // //       release(&p->lock);
++// // //       yield();
++// // //     } else {
++// // //       release(&p->lock);
++// // //     }
++// // //   }
++// // // #else
++// // //   // For Round-Robin, yield on every timer interrupt.
++// // //   if(which_dev == 2)
++// // //     yield();
++// // // #endif
++
++// // //   prepare_return();
++
++// // //   // the user page table to switch to, for trampoline.S
++// // //   uint64 satp = MAKE_SATP(p->pagetable);
++
++// // //   // return to trampoline.S; satp value in a0.
++// // //   return satp;
++// // // }
++
++// // // //
++// // // // set up trapframe and control registers for a return to user space
++// // // //
++// // // void
++// // // prepare_return(void)
++// // // {
++// // //   struct proc *p = myproc();
++
++// // //   // we're about to switch the destination of traps from
++// // //   // kerneltrap() to usertrap(). because a trap from kernel
++// // //   // code to usertrap would be a disaster, turn off interrupts.
++// // //   intr_off();
++
++// // //   // send syscalls, interrupts, and exceptions to uservec in trampoline.S
++// // //   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
++// // //   w_stvec(trampoline_uservec);
++
++// // //   // set up trapframe values that uservec will need when
++// // //   // the process next traps into the kernel.
++// // //   p->trapframe->kernel_satp = r_satp();         // kernel page table
++// // //   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
++// // //   p->trapframe->kernel_trap = (uint64)usertrap;
++// // //   p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
++
++// // //   // set up the registers that trampoline.S's sret will use
++// // //   // to get to user space.
++  
++// // //   // set S Previous Privilege mode to User.
++// // //   unsigned long x = r_sstatus();
++// // //   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
++// // //   x |= SSTATUS_SPIE; // enable interrupts in user mode
++// // //   w_sstatus(x);
++
++// // //   // set S Exception Program Counter to the saved user pc.
++// // //   w_sepc(p->trapframe->epc);
++// // // }
++
++// // // // interrupts and exceptions from kernel code go here via kernelvec,
++// // // // on whatever the current kernel stack is.
++// // // void 
++// // // kerneltrap()
++// // // {
++// // //   int which_dev = 0;
++// // //   uint64 sepc = r_sepc();
++// // //   uint64 sstatus = r_sstatus();
++// // //   uint64 scause = r_scause();
++  
++// // //   if((sstatus & SSTATUS_SPP) == 0)
++// // //     panic("kerneltrap: not from supervisor mode");
++// // //   if(intr_get() != 0)
++// // //     panic("kerneltrap: interrupts enabled");
++
++// // //   if((which_dev = devintr()) == 0){
++// // //     // interrupt or trap from an unknown source
++// // //     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
++// // //     panic("kerneltrap");
++// // //   }
++
++// // //   // give up the CPU if this is a timer interrupt.
++// // //   if(which_dev == 2 && myproc() != 0)
++// // //     yield();
++
++// // //   // the yield() may have caused some traps to occur,
++// // //   // so restore trap registers for use by kernelvec.S's sepc instruction.
++// // //   w_sepc(sepc);
++// // //   w_sstatus(sstatus);
++// // // }
++
++// // // void
++// // // clockintr()
++// // // {
++// // //   if(cpuid() == 0){
++// // //     acquire(&tickslock);
++// // //     ticks++;
++// // //     wakeup(&ticks);
++// // //     release(&tickslock);
++// // //   }
++
++// // //   // ask for the next timer interrupt. this also clears
++// // //   // the interrupt request. 1000000 is about a tenth
++// // //   // of a second.
++// // //   w_stimecmp(r_time() + 1000000);
++// // // }
++
++// // // // check if it's an external interrupt or software interrupt,
++// // // // and handle it.
++// // // // returns 2 if timer interrupt,
++// // // // 1 if other device,
++// // // // 0 if not recognized.
++// // // int
++// // // devintr()
++// // // {
++// // //   uint64 scause = r_scause();
++
++// // //   if(scause == 0x8000000000000009L){
++// // //     // this is a supervisor external interrupt, via PLIC.
++
++// // //     // irq indicates which device interrupted.
++// // //     int irq = plic_claim();
++
++// // //     if(irq == UART0_IRQ){
++// // //       uartintr();
++// // //     } else if(irq == VIRTIO0_IRQ){
++// // //       virtio_disk_intr();
++// // //     } else if(irq){
++// // //       printf("unexpected interrupt irq=%d\n", irq);
++// // //     }
++
++// // //     // the PLIC allows each device to raise at most one
++// // //     // interrupt at a time; tell the PLIC the device is
++// // //     // now allowed to interrupt again.
++// // //     if(irq)
++// // //       plic_complete(irq);
++
++// // //     return 1;
++// // //   } else if(scause == 0x8000000000000005L){
++// // //     // timer interrupt.
++// // //     clockintr();
++// // //     return 2;
++// // //   } else {
++// // //     return 0;
++// // //   }
++// // // }
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..a891f7d 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,8 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++int proc_stats(void);
++int getreadcount(void); 
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..045f480 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("proc_stats");
++entry("getreadcount");
+\ No newline at end of file
